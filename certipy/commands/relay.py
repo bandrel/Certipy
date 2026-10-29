@@ -53,6 +53,7 @@ from certipy.lib.ces import (
     SOAP_CONTENT_TYPE,
     CESError,
     build_wstep_request,
+    default_ces_path,
     parse_wstep_response,
 )
 from certipy.lib.constants import OID_TO_STR_NAME_MAP, USER_AGENT
@@ -1067,13 +1068,28 @@ class Relay:
                 exit(1)
 
             try:
-                self.base_url, self.ces_to_url, _ = self._build_ces_target(self.target)
+                self.base_url, self.ces_to_url, path = self._build_ces_target(
+                    self.target
+                )
             except ValueError:
                 logging.error(
                     f"Invalid CES target URL: {self.target!r}. Expected "
                     "https://host/<CA>_CES_<Auth>/service.svc/CES"
                 )
                 exit(1)
+
+            # A bare host has no CES path; relaying to "/" never gets an NTLM
+            # challenge, so derive the default endpoint from the CA name instead
+            if path == "/":
+                if not ca:
+                    logging.error(
+                        f"CES target {self.target!r} has no endpoint path. Pass the "
+                        "full CES URL (see 'Enrollment Web Service' in 'certipy find') "
+                        "or the CA name with -ca"
+                    )
+                    exit(1)
+                self.ces_to_url = f"{self.base_url}{default_ces_path(ca)}"
+
             self.target = self.ces_to_url
             logging.info(f"Targeting {self.target} (ESC8 - CES)")
         else:

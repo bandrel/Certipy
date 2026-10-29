@@ -248,6 +248,40 @@ def test_relay_init_ces_rejects_invalid_target(stub_relay_server: None, bad: str
         Relay(target=bad, ces=True)
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://braavos.essos.local",
+        "braavos.essos.local",
+        "https://braavos.essos.local/",
+    ],
+)
+def test_relay_init_ces_bare_host_uses_ca_default_path(
+    stub_relay_server: None, target: str
+):
+    r = Relay(target=target, ca="ESSOS-CA", ces=True, template="User")
+    assert r.ces_to_url == CES_URL
+    assert r.target == CES_URL
+    assert r.base_url == "https://braavos.essos.local"
+
+
+def test_relay_init_ces_bare_host_quotes_ca_name(stub_relay_server: None):
+    r = Relay(target="https://ca01.example.com", ca="My CA", ces=True)
+    assert (
+        r.ces_to_url == "https://ca01.example.com/My%20CA_CES_Kerberos/service.svc/CES"
+    )
+
+
+def test_relay_init_ces_explicit_path_wins_over_ca(stub_relay_server: None):
+    r = Relay(target=CES_URL, ca="OTHER-CA", ces=True)
+    assert r.ces_to_url == CES_URL
+
+
+def test_relay_init_ces_bare_host_without_ca_rejected(stub_relay_server: None):
+    with pytest.raises(SystemExit):
+        Relay(target="https://braavos.essos.local", ces=True)
+
+
 def test_relay_init_ces_rejects_rpc_target(stub_relay_server: None):
     with pytest.raises(SystemExit):
         Relay(target="rpc://h", ca="X", ces=True)
