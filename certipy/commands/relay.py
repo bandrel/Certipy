@@ -669,8 +669,11 @@ class ADCSHTTPAttackClient(ProtocolAttack):
         # auth handshake, so use an extended timeout for the POST request.
         # Use at least 60 seconds, or the session's configured read timeout
         # if larger.
-        session_read_timeout = getattr(self.client.timeout, "read", 10) or 10
-        cert_request_timeout = max(session_read_timeout, 60)
+        # A disabled session timeout (None) is preserved.
+        session_read_timeout = self.client.timeout.read
+        cert_request_timeout = (
+            None if session_read_timeout is None else max(session_read_timeout, 60)
+        )
 
         # Use the raw (percent-encoded) path rather than the decoded `.path`
         # — a CA name containing a space would otherwise be re-encoded
@@ -971,7 +974,8 @@ class Relay:
         Initialize the NTLM relay attack.
 
         Args:
-            target: Target AD CS server (http://server/certsrv/ or rpc://server)
+            target: Target AD CS server (http://server/certsrv/, rpc://server, or with
+                -ces https://server/<CA>_CES_<Auth>/service.svc/CES)
             ca: Certificate Authority name (required for RPC)
             template: Certificate template to request
             upn: Alternative UPN (User Principal Name)
@@ -1032,6 +1036,10 @@ class Relay:
 
         # Configure target based on URL or RPC string
         if self.target.startswith("rpc://"):
+            if self.ces:
+                logging.error("-ces requires an https:// CES URL target, not rpc://")
+                exit(1)
+
             if ca is None:
                 logging.error("A certificate authority is required for RPC attacks")
                 exit(1)
@@ -1044,7 +1052,14 @@ class Relay:
                 )
                 exit(1)
 
-            self.base_url, self.ces_to_url, _ = self._build_ces_target(self.target)
+            try:
+                self.base_url, self.ces_to_url, _ = self._build_ces_target(self.target)
+            except ValueError:
+                logging.error(
+                    f"Invalid CES target URL: {self.target!r}. Expected "
+                    "https://host/<CA>_CES_<Auth>/service.svc/CES"
+                )
+                exit(1)
             self.target = self.ces_to_url
             logging.info(f"Targeting {self.target} (ESC8 - CES)")
         else:
@@ -1121,11 +1136,22 @@ class Relay:
         Returns:
             Tuple of (base_url, to_url, path), where base_url is scheme://host[:port],
             to_url is the full URL and path is the URL path
+
+        Raises:
+            ValueError: If the target is empty, malformed, has no host, or uses a
+                scheme other than http or https
         """
-        if not target.startswith("http://") and not target.startswith("https://"):
+        if "://" not in target:
             target = f"https://{target}"
 
-        url = httpx.URL(target)
+        try:
+            url = httpx.URL(target)
+        except httpx.InvalidURL as e:
+            raise ValueError(f"Invalid CES target URL: {target!r}") from e
+
+        if url.scheme not in ("http", "https") or not url.host:
+            raise ValueError(f"Invalid CES target URL: {target!r}")
+
         base_url = f"{url.scheme}://{url.host}"
         if url.port is not None:
             base_url += f":{url.port}"

@@ -49,7 +49,9 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> Tuple[str, Callable
         description=(
             "Perform NTLM relay attacks against Active Directory Certificate Services. "
             "This allows obtaining certificates for relayed users and computers, "
-            "which can be used for authentication and potential privilege escalation."
+            "which can be used for authentication and potential privilege escalation. "
+            "Relay supports Web Enrollment (ESC8), RPC (ESC11), and CES "
+            "(ESC8 over CES with -ces)."
         ),
     )
 

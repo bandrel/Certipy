@@ -124,8 +124,10 @@ def test_ces_attack_posts_wstep_and_saves(monkeypatch: pytest.MonkeyPatch):
     assert seen["path"] == "/ESSOS-CA_CES_Kerberos/service.svc/CES"
     assert seen["ctype"].startswith("application/soap+xml")
     assert b"RequestSecurityToken" in seen["body"]
-    assert b"CertificateTemplate" in seen["body"]
-    assert b"User" in seen["body"]
+    assert (
+        b'<ContextItem Name="CertificateTemplate"><Value>User</Value></ContextItem>'
+        in seen["body"]
+    )
     assert len(saved) == 1
 
 
@@ -186,7 +188,10 @@ def test_ces_attack_default_template_machine(monkeypatch: pytest.MonkeyPatch):
         return httpx.Response(401)
 
     _make_attack(handler, template=None, username="WS01$")._request_certificate_ces()
-    assert b"Machine" in seen["body"]
+    assert (
+        b'<ContextItem Name="CertificateTemplate"><Value>Machine</Value></ContextItem>'
+        in seen["body"]
+    )
 
 
 def test_ces_attack_dispatch(monkeypatch: pytest.MonkeyPatch):
@@ -226,3 +231,43 @@ def test_relay_init_ces_rejects_retrieve(stub_relay_server: None):
 def test_relay_init_ces_rejects_enum_templates(stub_relay_server: None):
     with pytest.raises(SystemExit):
         Relay(target=CES_URL, ces=True, enum_templates=True)
+
+
+@pytest.mark.parametrize("bad", ["", "ftp://h/x"])
+def test_build_ces_target_rejects_invalid(bad: str):
+    with pytest.raises(ValueError):
+        Relay._build_ces_target(bad)
+
+
+@pytest.mark.parametrize("bad", ["", "ftp://h/x"])
+def test_relay_init_ces_rejects_invalid_target(stub_relay_server: None, bad: str):
+    with pytest.raises(SystemExit):
+        Relay(target=bad, ces=True)
+
+
+def test_relay_init_ces_rejects_rpc_target(stub_relay_server: None):
+    with pytest.raises(SystemExit):
+        Relay(target="rpc://h", ca="X", ces=True)
+
+
+@pytest.mark.parametrize("session_timeout,expected", [(None, None), (5, 60)])
+def test_ces_attack_timeout_override(
+    monkeypatch: pytest.MonkeyPatch, session_timeout: Optional[float], expected: Any
+):
+    _record_saves(monkeypatch)
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["read"] = request.extensions["timeout"]["read"]
+        return httpx.Response(401)
+
+    attack = _make_attack(handler)
+    client = httpx.Client(
+        base_url="https://10.0.0.5",
+        transport=httpx.MockTransport(handler),
+        timeout=session_timeout,
+    )
+    client.user = "ESSOS\\missandei"  # type: ignore[attr-defined]
+    attack.client = client  # type: ignore[attr-defined]
+    attack._request_certificate_ces()
+    assert seen["read"] == expected
