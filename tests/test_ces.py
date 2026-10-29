@@ -215,8 +215,13 @@ def test_parse_invalid_certificate_token():
 
 @pytest.mark.parametrize(
     "data",
-    [b"", b"<not-xml", b"x" * (MAX_RESPONSE_SIZE + 1)],
-    ids=["empty", "malformed", "oversized"],
+    [
+        b"",
+        b"<not-xml",
+        b"x" * (MAX_RESPONSE_SIZE + 1),
+        b'<?xml version="1.0" encoding="bogus-enc"?><a/>',
+    ],
+    ids=["empty", "malformed", "oversized", "unknown-encoding"],
 )
 def test_parse_rejects_bad_bodies(data: bytes):
     with pytest.raises(CESError):

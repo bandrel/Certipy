@@ -243,7 +243,7 @@ def parse_wstep_response(data: bytes) -> WstepResponse:
 
     try:
         root = ElementTree.fromstring(data)
-    except ElementTree.ParseError as e:
+    except (ElementTree.ParseError, LookupError) as e:
         raise CESError(f"CES returned malformed XML: {e}") from e
 
     request_id = _parse_int(_find_text(root, f".//{{{ENROLL_NS}}}RequestID"))
