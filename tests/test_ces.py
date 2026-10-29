@@ -1,11 +1,12 @@
 import base64
 import datetime
-import xml.etree.ElementTree as ET
+from xml.etree import ElementTree
 
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509.oid import NameOID
 
 from certipy.lib.ces import (
@@ -31,7 +32,7 @@ CES_URL = "https://braavos.essos.local/ESSOS-CA_CES_Kerberos/service.svc/CES"
 CSR = b"\x30\x03\x02\x01\x00"
 
 
-def _context_items(root: ET.Element) -> list[tuple[str | None, str | None]]:
+def _context_items(root: ElementTree.Element) -> list[tuple[str | None, str | None]]:
     items = root.findall(f".//{{{AUTHZ_NS}}}ContextItem")
     return [(i.get("Name"), i.findtext(f"{{{AUTHZ_NS}}}Value")) for i in items]
 
@@ -40,12 +41,16 @@ def test_default_ces_path():
     assert default_ces_path("ESSOS-CA") == "/ESSOS-CA_CES_Kerberos/service.svc/CES"
 
 
+def test_default_ces_path_escapes_slash():
+    assert default_ces_path("A/B") == "/A%2FB_CES_Kerberos/service.svc/CES"
+
+
 def test_default_ces_path_quotes_ca_name():
     assert default_ces_path("My CA") == "/My%20CA_CES_Kerberos/service.svc/CES"
 
 
 def test_build_wstep_request_headers():
-    root = ET.fromstring(
+    root = ElementTree.fromstring(
         build_wstep_request(
             CES_URL, CSR, ["CertificateTemplate:User"], message_id="urn:uuid:1"
         )
@@ -58,7 +63,7 @@ def test_build_wstep_request_headers():
 
 
 def test_build_wstep_request_body():
-    root = ET.fromstring(
+    root = ElementTree.fromstring(
         build_wstep_request(CES_URL, CSR, ["CertificateTemplate:User"])
     )
     rst = root.find(f"{{{SOAP_NS}}}Body/{{{WST_NS}}}RequestSecurityToken")
@@ -73,7 +78,7 @@ def test_build_wstep_request_body():
 
 
 def test_build_wstep_request_generates_message_id():
-    root = ET.fromstring(
+    root = ElementTree.fromstring(
         build_wstep_request(CES_URL, CSR, ["CertificateTemplate:User"])
     )
     message_id = root.findtext(f".//{{{ADDR_NS}}}MessageID") or ""
@@ -81,7 +86,7 @@ def test_build_wstep_request_generates_message_id():
 
 
 def test_build_wstep_request_context_items():
-    root = ET.fromstring(
+    root = ElementTree.fromstring(
         build_wstep_request(
             CES_URL,
             CSR,
@@ -98,7 +103,7 @@ def test_build_wstep_request_context_items():
 
 
 def test_build_wstep_request_escapes_values():
-    root = ET.fromstring(
+    root = ElementTree.fromstring(
         build_wstep_request(CES_URL + "?a=1&b=2", CSR, ['Certificate"Template:<A&B>'])
     )
     assert root.findtext(f".//{{{ADDR_NS}}}To") == CES_URL + "?a=1&b=2"
@@ -125,6 +130,33 @@ def _self_signed_der() -> bytes:
         .sign(key, hashes.SHA256())
     )
     return cert.public_bytes(serialization.Encoding.DER)
+
+
+def _chain() -> tuple[x509.Certificate, x509.Certificate]:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ces-test-ca")])
+    leaf_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ces-test-leaf")])
+
+    def build(
+        subject: x509.Name, issuer: x509.Name, pub: rsa.RSAPublicKey, serial: int
+    ) -> x509.Certificate:
+        return (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(pub)
+            .serial_number(serial)
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .sign(ca_key, hashes.SHA256())
+        )
+
+    return (
+        build(ca_name, ca_name, ca_key.public_key(), 1),
+        build(leaf_name, ca_name, leaf_key.public_key(), 2),
+    )
 
 
 def _rstr(
@@ -180,6 +212,41 @@ def test_parse_issued_certificate():
     assert response.certificate.public_bytes(serialization.Encoding.DER) == der
     assert response.request_id == 17
     assert response.disposition_message == "Issued"
+
+
+def test_parse_pkcs7_issuance_returns_leaf():
+    ca_cert, leaf_cert = _chain()
+    # CA listed first so that picking the first cert would be wrong
+    bundle = pkcs7.serialize_certificates(
+        [ca_cert, leaf_cert], serialization.Encoding.DER
+    )
+    response = parse_wstep_response(_rstr(cert_token=base64.b64encode(bundle).decode()))
+    assert response.certificate is not None
+    assert response.certificate.subject == leaf_cert.subject
+
+
+def test_parse_prefers_requested_security_token():
+    stray = base64.b64encode(_self_signed_der()).decode()
+    wanted_der = _self_signed_der()
+    stray_token = (
+        f'<BinarySecurityToken ValueType="{TOKEN_TYPE_X509V3}" '
+        f'EncodingType="{ENCODING_TYPE_BASE64}" xmlns="{WSS_NS}">{stray}'
+        "</BinarySecurityToken>"
+    ).encode()
+    body = _rstr(cert_token=base64.b64encode(wanted_der).decode()).replace(
+        b"<RequestSecurityTokenResponse>",
+        b"<RequestSecurityTokenResponse>" + stray_token,
+        1,
+    )
+    # a stray token after it must not win either
+    body = body.replace(
+        b"</RequestSecurityTokenResponse>",
+        stray_token + b"</RequestSecurityTokenResponse>",
+        1,
+    )
+    response = parse_wstep_response(body)
+    assert response.certificate is not None
+    assert response.certificate.public_bytes(serialization.Encoding.DER) == wanted_der
 
 
 def test_parse_pending():

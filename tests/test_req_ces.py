@@ -1,8 +1,8 @@
 import argparse
 import base64
-import xml.etree.ElementTree as ET
 from types import SimpleNamespace
 from typing import Any
+from xml.etree import ElementTree
 
 import httpx
 import pytest
@@ -12,6 +12,7 @@ from certipy.commands.parsers import req as req_parser
 from certipy.lib import req as req_module
 from certipy.lib.certificate import generate_rsa_key
 from certipy.lib.ces import ADDR_NS, AUTHZ_NS, WST_NS
+from certipy.lib.constants import USER_AGENT
 from certipy.lib.kerberos import HttpxKerberosAuth
 from certipy.lib.ntlm import HttpxNtlmAuth
 from certipy.lib.req import (
@@ -78,7 +79,7 @@ def test_ces_request_posts_wstep_envelope():
     assert seen["method"] == "POST"
     assert seen["path"] == PATH
     assert seen["content_type"].startswith("application/soap+xml")
-    root = ET.fromstring(seen["body"])
+    root = ElementTree.fromstring(seen["body"])
     assert root.findtext(f".//{{{ADDR_NS}}}To") == TO_URL
     assert root.find(f".//{{{WST_NS}}}RequestSecurityToken") is not None
     item = root.find(f".//{{{AUTHZ_NS}}}ContextItem")
@@ -86,9 +87,21 @@ def test_ces_request_posts_wstep_envelope():
 
 
 def test_ces_request_pending_offers_key_save(pending_saves: list[int]):
-    session = _session(lambda r: _xml_response(200, _rstr(request_id="19")))
+    session = _session(
+        lambda r: _xml_response(
+            200, _rstr(request_id="19", disposition="Taken Under Submission")
+        )
+    )
     assert _call(session) is None
     assert pending_saves == [19]
+
+
+def test_ces_request_issued_without_certificate_is_not_pending(
+    pending_saves: list[int],
+):
+    session = _session(lambda r: _xml_response(200, _rstr(request_id="21")))
+    assert _call(session) is None
+    assert pending_saves == []
 
 
 def test_ces_request_fault_returns_none(pending_saves: list[int]):
@@ -145,6 +158,17 @@ def test_interface_non_default_port_and_custom_path():
     assert interface.session.headers["Host"] == "braavos.essos.local:8443"
 
 
+def test_interface_relative_ces_path_is_normalized():
+    interface = CESRequestInterface(
+        _parent(ces_path="Custom_CES_Kerberos/service.svc/CES")  # type: ignore[arg-type]
+    )
+    assert interface.path == "/Custom_CES_Kerberos/service.svc/CES"
+    assert (
+        interface.endpoint_url
+        == "https://braavos.essos.local/Custom_CES_Kerberos/service.svc/CES"
+    )
+
+
 def test_interface_falls_back_to_ip_without_hostname():
     parent = _parent(
         target=SimpleNamespace(
@@ -153,13 +177,42 @@ def test_interface_falls_back_to_ip_without_hostname():
     )
     interface = CESRequestInterface(parent)  # type: ignore[arg-type]
     assert interface.endpoint_url == f"https://10.0.0.5{PATH}"
-    assert interface.session.headers.get("Host") != ""
+    assert "Host" not in interface.session.headers
 
 
 def test_interface_requires_ca_or_path():
     interface = CESRequestInterface(_parent(ca=None))  # type: ignore[arg-type]
     with pytest.raises(Exception, match="-ca"):
         _ = interface.path
+
+
+def test_interface_request_requires_key():
+    interface = CESRequestInterface(_parent(key=None))  # type: ignore[arg-type]
+    with pytest.raises(Exception, match="private key"):
+        interface.request(b"csr", [])
+
+
+def test_interface_request_calls_ces_request(monkeypatch: pytest.MonkeyPatch):
+    key = generate_rsa_key(2048)
+    parent = _parent(key=key, template="User", out="out")
+    parent.target.username = "missandei"
+    interface = CESRequestInterface(parent)  # type: ignore[arg-type]
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(req_module, "ces_request", lambda *a: calls.append(a) or "ok")
+    assert interface.request(b"csr", ["CertificateTemplate:User"]) == "ok"
+    assert calls == [
+        (
+            interface.session,
+            PATH,
+            TO_URL,
+            "missandei",
+            b"csr",
+            ["CertificateTemplate:User"],
+            "User",
+            key,
+            "out",
+        )
+    ]
 
 
 def test_interface_retrieve_not_supported():
@@ -180,6 +233,7 @@ def test_create_http_session_auth_selection():
     )
     assert isinstance(ntlm.auth, HttpxNtlmAuth)
     assert isinstance(kerberos.auth, HttpxKerberosAuth)
+    assert ntlm.headers["User-Agent"] == USER_AGENT
 
 
 @pytest.mark.parametrize(
@@ -221,11 +275,12 @@ def test_parser_defaults():
     assert options.http_scheme is None
 
 
-def test_entry_rejects_ces_with_web(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("other", ["-web", "-dcom"])
+def test_entry_rejects_ces_with_web(monkeypatch: pytest.MonkeyPatch, other: str):
     built: list[Any] = []
     monkeypatch.setattr(req_command, "Request", lambda **kw: built.append(kw))
     monkeypatch.setattr(
         req_command.Target, "from_options", staticmethod(lambda options: object())
     )
-    req_command.entry(_parse("-ces", "-web"))
+    req_command.entry(_parse("-ces", other))
     assert built == []

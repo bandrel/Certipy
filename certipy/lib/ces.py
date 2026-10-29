@@ -24,6 +24,8 @@ from typing import List, Optional
 from urllib.parse import quote
 from xml.etree import ElementTree
 
+from cryptography.hazmat.primitives.serialization import pkcs7
+
 from certipy.lib.certificate import der_to_cert, x509
 
 # =========================================================================
@@ -68,7 +70,7 @@ def default_ces_path(ca: str) -> str:
     Returns:
         URL path of the CES endpoint
     """
-    return f"/{quote(ca)}_CES_Kerberos/service.svc/CES"
+    return f"/{quote(ca, safe="")}_CES_Kerberos/service.svc/CES"
 
 
 def _build_additional_context(attributes_list: List[str]) -> str:
@@ -223,6 +225,76 @@ def _parse_int(value: Optional[str]) -> Optional[int]:
         return None
 
 
+def _decode_certificate(data: bytes) -> x509.Certificate:
+    """
+    Decode a certificate token payload, either a DER certificate or a PKCS#7 bundle.
+
+    Args:
+        data: Decoded token bytes
+
+    Returns:
+        The issued (leaf) certificate
+
+    Raises:
+        ValueError: If the data is neither a certificate nor a PKCS#7 bundle
+    """
+    try:
+        return der_to_cert(data)
+    except ValueError:
+        pass
+
+    certificates = pkcs7.load_der_pkcs7_certificates(data)
+    if len(certificates) == 1:
+        return certificates[0]
+
+    issuers = {cert.issuer for cert in certificates if cert.issuer != cert.subject}
+    leaves = [cert for cert in certificates if cert.subject not in issuers]
+    if len(leaves) == 1:
+        return leaves[0]
+
+    # Ambiguous chain, fall back to the first certificate
+    return certificates[0]
+
+
+def _parse_certificate_token(root: ElementTree.Element) -> Optional[x509.Certificate]:
+    """
+    Extract the issued certificate from a WSTEP response.
+
+    Prefers the token inside RequestedSecurityToken, falling back to the first
+    X509v3 BinarySecurityToken.
+
+    Args:
+        root: Parsed response document
+
+    Returns:
+        The certificate, or None if the response carries no certificate token
+
+    Raises:
+        CESError: If the token cannot be decoded
+    """
+    token = root.find(
+        f".//{{{WST_NS}}}RequestedSecurityToken/{{{WSS_NS}}}BinarySecurityToken"
+    )
+    candidates = [token] if token is not None else []
+    candidates += [
+        t
+        for t in root.iter(f"{{{WSS_NS}}}BinarySecurityToken")
+        if "X509v3" in t.get("ValueType", "")
+    ]
+
+    for candidate in candidates:
+        value = re.sub(r"\s+", "", candidate.text or "")
+        if not value:
+            continue
+
+        try:
+            return _decode_certificate(base64.b64decode(value, validate=True))
+        except ValueError as e:
+            raise CESError("CES returned an invalid certificate token") from e
+
+    return None
+
+
 def parse_wstep_response(data: bytes) -> WstepResponse:
     """
     Parse a WSTEP response from the Certificate Enrollment Web Service.
@@ -257,19 +329,7 @@ def parse_wstep_response(data: bytes) -> WstepResponse:
             error_code &= 0xFFFFFFFF
         raise CESError(reason, error_code=error_code, request_id=request_id)
 
-    certificate = None
-    for token in root.iter(f"{{{WSS_NS}}}BinarySecurityToken"):
-        if "X509v3" not in token.get("ValueType", ""):
-            continue
-
-        value = re.sub(r"\s+", "", token.text or "")
-        if not value:
-            continue
-
-        try:
-            certificate = der_to_cert(base64.b64decode(value, validate=True))
-        except ValueError as e:
-            raise CESError("CES returned an invalid X509v3 certificate token") from e
+    certificate = _parse_certificate_token(root)
 
     return WstepResponse(
         certificate=certificate,

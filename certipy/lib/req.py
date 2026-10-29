@@ -536,6 +536,7 @@ def create_http_session(
         auth=auth,
         timeout=target.timeout,
         verify=False,
+        headers={"User-Agent": USER_AGENT},
     )
 
 
@@ -908,9 +909,18 @@ def ces_request(
         logging.info("Successfully requested certificate")
         return response.certificate
 
-    logging.warning(
-        f"Certificate request is pending approval: {response.disposition_message!r}"
-    )
+    disposition = response.disposition_message
+    if disposition is not None and not any(
+        marker in disposition.lower()
+        for marker in ("pending", "submission", "taken under")
+    ):
+        logging.error(
+            f"CES reported {disposition!r} but returned no usable certificate token"
+        )
+        _log_response_if_verbose(res.text)
+        return None
+
+    logging.warning(f"Certificate request is pending approval: {disposition!r}")
     _log_response_if_verbose(res.text)
     if response.request_id is not None:
         handle_pending_key_save(response.request_id, key, out)
@@ -1395,7 +1405,9 @@ class CESRequestInterface:
             Exception: If neither a CES path nor a CA name is set
         """
         if self.parent.ces_path:
-            return self.parent.ces_path
+            if self.parent.ces_path.startswith("/"):
+                return self.parent.ces_path
+            return f"/{self.parent.ces_path}"
 
         if not self.parent.ca:
             raise Exception("A CA name (-ca) or CES path (-ces-path) is required")
