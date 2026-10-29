@@ -20,13 +20,14 @@ import json
 import time
 from collections import OrderedDict
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, cast
 
 import httpx
 import requests
 from asn1crypto import x509
 from impacket.dcerpc.v5 import rpcrt, rrp
 
+from certipy.lib.ces import parse_enrollment_servers
 from certipy.lib.constants import (
     EXTENDED_RIGHTS_MAP,
     EXTENDED_RIGHTS_NAME_MAP,
@@ -230,6 +231,7 @@ class Find:
                 "cACertificateDN",
                 "cACertificate",
                 "certificateTemplates",
+                "msPKI-Enrollment-Servers",
                 "objectGUID",
             ],
         )
@@ -453,6 +455,7 @@ class Find:
                             "http": {"enabled": "Unknown"},
                             "https": {"enabled": "Unknown", "channel_binding": None},
                         },
+                        "enrollment_web_service": [],
                     }
 
                 else:
@@ -493,6 +496,7 @@ class Find:
                 "http": {"enabled": "Unknown"},
                 "https": {"enabled": "Unknown", "channel_binding": None},
             },
+            "enrollment_web_service": [],
         }
 
         ca_name = ca.get("name")
@@ -597,7 +601,54 @@ class Find:
             logging.warning(f"Failed to check Web Enrollment for CA {ca_name!r}: {e}")
             handle_error(True)
 
+        # Check Certificate Enrollment Web Service (CES) endpoints
+        try:
+            ca_properties["enrollment_web_service"] = (
+                self._check_enrollment_web_service(ca)
+            )
+        except Exception as e:
+            logging.warning(f"Failed to check CES endpoints for CA {ca_name!r}: {e}")
+            handle_error(True)
+
         return ca_properties
+
+    def _check_enrollment_web_service(self, ca: LDAPEntry) -> List[Dict[str, Any]]:
+        """
+        Read msPKI-Enrollment-Servers for a CA and probe each CES endpoint.
+
+        Args:
+            ca: Certificate authority object
+
+        Returns:
+            List of endpoint dictionaries (uri, auth, priority, renewals_only,
+            scheme, reachable, channel_binding)
+        """
+        values = ca.get("msPKI-Enrollment-Servers") or []
+        if isinstance(values, (str, bytes)):
+            values = [values]
+        decoded = [
+            v.decode("utf-8", "replace") if isinstance(v, bytes) else v for v in values
+        ]
+
+        endpoints: List[Dict[str, Any]] = []
+        for server in parse_enrollment_servers(decoded):
+            logging.debug(f"Probing CES endpoint {server.uri!r}")
+            scheme = "https" if server.uri.lower().startswith("https") else "http"
+            reachable, channel_binding = self.probe_enrollment_server(server.uri)
+            endpoints.append(
+                {
+                    "uri": server.uri,
+                    "auth": server.auth_names,
+                    "priority": server.priority,
+                    "renewals_only": server.renewals_only,
+                    "scheme": scheme,
+                    "reachable": reachable,
+                    "channel_binding": (
+                        "Unknown" if channel_binding is None else channel_binding
+                    ),
+                }
+            )
+        return endpoints
 
     def _process_ca_certificate(self, ca: LDAPEntry):
         """
@@ -790,6 +841,139 @@ class Find:
         except Exception as e:
             logging.warning(f"Failed to check channel binding: {e}")
             handle_error(True)
+            return None
+
+    def probe_enrollment_server(
+        self,
+        uri: str,
+        session_factory: Optional[Callable[[], httpx.Client]] = None,
+    ) -> Tuple[bool, Optional[bool]]:
+        """
+        Probe a CES endpoint for reachability and channel binding (EPA).
+
+        Args:
+            uri: Full CES endpoint URL from msPKI-Enrollment-Servers
+            session_factory: Optional factory returning an httpx client
+                (used to inject a mock transport in tests)
+
+        Returns:
+            Tuple of (reachable, channel_binding_enforced). reachable is True
+            when the endpoint answers with an auth challenge; channel_binding
+            is None when not evaluated (unreachable, non-HTTPS, or inconclusive).
+        """
+        parsed = httpx.URL(uri)
+        try:
+            target_ip = self.target.resolver.resolve(parsed.host)
+        except Exception as e:
+            logging.debug(f"Could not resolve {parsed.host!r}: {e}")
+            target_ip = parsed.host
+
+        headers = {"User-Agent": USER_AGENT, "Host": parsed.host}
+        connect_url = str(parsed.copy_with(host=target_ip))
+
+        session = (
+            session_factory()
+            if session_factory
+            else httpx.Client(timeout=self.target.timeout, verify=False)
+        )
+        try:
+            res = session.get(
+                connect_url,
+                headers=headers,
+                timeout=self.target.timeout,
+                follow_redirects=False,
+            )
+            reachable = res.status_code in (200, 401)
+        except Exception as e:
+            logging.debug(f"CES endpoint {uri!r} not reachable: {e}")
+            return False, None
+        finally:
+            session.close()
+
+        if not reachable or parsed.scheme != "https":
+            return reachable, None
+
+        try:
+            channel_binding = self.check_enrollment_channel_binding(parsed, target_ip)
+        except Exception as e:
+            logging.debug(f"Channel binding check failed for {uri!r}: {e}")
+            channel_binding = None
+        return reachable, channel_binding
+
+    def check_enrollment_channel_binding(
+        self, parsed_url: httpx.URL, target_ip: str
+    ) -> Optional[bool]:
+        """
+        Check whether a CES endpoint enforces channel binding (EPA).
+
+        Tests authentication to the CES endpoint with and without channel
+        binding, mirroring check_channel_binding for web enrollment.
+
+        Args:
+            parsed_url: Parsed CES endpoint URL
+            target_ip: IP address to connect to
+
+        Returns:
+            True if enforced, False if disabled, None if inconclusive or failed
+        """
+        host = parsed_url.host
+        try:
+            ca_target = copy.copy(self.target)
+            ca_target.remote_name = host
+
+            if not self.target.do_kerberos:
+                no_cb_auth = HttpxNtlmAuth(ca_target, channel_binding=False)
+                cb_auth = HttpxNtlmAuth(ca_target, channel_binding=True)
+            else:
+                no_cb_auth = HttpxKerberosAuth(ca_target, channel_binding=False)
+                cb_auth = HttpxKerberosAuth(ca_target, channel_binding=True)
+
+            url = str(parsed_url.copy_with(host=target_ip))
+            headers = {"User-Agent": USER_AGENT, "Host": host}
+
+            with httpx.Client(
+                auth=no_cb_auth, timeout=self.target.timeout, verify=False
+            ) as session:
+                res_no_cb = session.get(
+                    url,
+                    headers=headers,
+                    timeout=self.target.timeout,
+                    follow_redirects=False,
+                )
+            logging.debug(
+                f"CES {host!r} responds with {res_no_cb.status_code} without channel binding"
+            )
+            if res_no_cb.status_code != 401:
+                logging.debug("CES channel binding (EPA) seems disabled")
+                return False
+
+            with httpx.Client(
+                auth=cb_auth, timeout=self.target.timeout, verify=False
+            ) as session:
+                res_cb = session.get(
+                    url,
+                    headers=headers,
+                    timeout=self.target.timeout,
+                    follow_redirects=False,
+                )
+            logging.debug(
+                f"CES {host!r} responds with {res_cb.status_code} with channel binding"
+            )
+            if res_cb.status_code != 401:
+                logging.debug("CES channel binding (EPA) seems enabled")
+                return True
+
+            logging.warning(
+                "CES channel binding (EPA) produces the same response as without it. Perhaps invalid credentials?"
+            )
+            return None
+        except NtlmNotSupportedError:
+            logging.warning(
+                "Failed to check CES channel binding: NTLM not supported. Try using Kerberos authentication (-k and -dc-host)."
+            )
+            return None
+        except Exception as e:
+            logging.debug(f"Failed to check CES channel binding: {e}")
             return None
 
     # =========================================================================
