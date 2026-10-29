@@ -1176,6 +1176,11 @@ class Relay:
                     )
                     exit(1)
                 self.ces_to_url = f"{self.base_url}{default_ces_path(ca)}"
+                logging.warning(
+                    f"Assuming the default CES endpoint {self.ces_to_url!r}. CES may "
+                    "use another host, name, or auth type; use -find-json or the "
+                    "URL from 'certipy find' to target the published endpoint"
+                )
 
             self.target = self.ces_to_url
             logging.info(f"Targeting {self.target} (ESC8 - CES)")
