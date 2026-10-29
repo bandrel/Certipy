@@ -1,3 +1,4 @@
+import argparse
 import base64
 import xml.etree.ElementTree as ET
 from types import SimpleNamespace
@@ -6,6 +7,8 @@ from typing import Any
 import httpx
 import pytest
 
+from certipy.commands import req as req_command
+from certipy.commands.parsers import req as req_parser
 from certipy.lib import req as req_module
 from certipy.lib.certificate import generate_rsa_key
 from certipy.lib.ces import ADDR_NS, AUTHZ_NS, WST_NS
@@ -197,3 +200,32 @@ def test_request_scheme_defaults(kwargs: dict[str, Any], scheme: Any, port: Any)
 def test_request_selects_ces_interface():
     request = Request(target=SimpleNamespace(), ces=True, ca="ESSOS-CA")  # type: ignore[arg-type]
     assert isinstance(request.interface, CESRequestInterface)
+
+
+def _parse(*argv: str) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    req_parser.add_subparser(parser.add_subparsers(dest="action"))
+    return parser.parse_args(["req", *argv])
+
+
+def test_parser_ces_flags():
+    options = _parse("-ces", "-ces-path", "/X_CES_Kerberos/service.svc/CES")
+    assert options.ces is True
+    assert options.ces_path == "/X_CES_Kerberos/service.svc/CES"
+
+
+def test_parser_defaults():
+    options = _parse()
+    assert options.ces is False
+    assert options.ces_path is None
+    assert options.http_scheme is None
+
+
+def test_entry_rejects_ces_with_web(monkeypatch: pytest.MonkeyPatch):
+    built: list[Any] = []
+    monkeypatch.setattr(req_command, "Request", lambda **kw: built.append(kw))
+    monkeypatch.setattr(
+        req_command.Target, "from_options", staticmethod(lambda options: object())
+    )
+    req_command.entry(_parse("-ces", "-web"))
+    assert built == []
