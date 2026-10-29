@@ -334,7 +334,7 @@ def test_ces_attack_missing_target_url_finishes_run(monkeypatch: pytest.MonkeyPa
 
 
 # =========================================================================
-# -find-json: choose the CES target from `certipy find -json` output
+# -json: choose the CES target from `certipy find -json` output
 # =========================================================================
 
 
@@ -469,6 +469,6 @@ def test_relay_init_find_json_requires_ces(stub_relay_server: None, tmp_path: An
 
 
 def test_parser_find_json_and_optional_target():
-    opts = _parse(["relay", "-ces", "-find-json", "find.json"])
+    opts = _parse(["relay", "-ces", "-json", "find.json"])
     assert opts.find_json == "find.json"
     assert opts.target is None

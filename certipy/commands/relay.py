@@ -1058,7 +1058,7 @@ class Relay:
         Args:
             target: Target AD CS server (http://server/certsrv/, rpc://server, or with
                 -ces https://server/<CA>_CES_<Auth>/service.svc/CES); optional with
-                -ces -find-json
+                -ces -json
             ca: Certificate Authority name (required for RPC)
             template: Certificate template to request
             upn: Alternative UPN (User Principal Name)
@@ -1117,7 +1117,7 @@ class Relay:
         self.attack_lock = Lock()
 
         if find_json and not ces:
-            logging.error("-find-json is only supported with -ces")
+            logging.error("-json is only supported with -ces")
             exit(1)
 
         if ces and find_json:
@@ -1130,7 +1130,7 @@ class Relay:
             target = resolved
 
         if not target:
-            logging.error("A target is required (-target), or use -ces with -find-json")
+            logging.error("A target is required (-target), or use -ces with -json")
             exit(1)
 
         self.target: str = target
@@ -1178,7 +1178,7 @@ class Relay:
                 self.ces_to_url = f"{self.base_url}{default_ces_path(ca)}"
                 logging.warning(
                     f"Assuming the default CES endpoint {self.ces_to_url!r}. CES may "
-                    "use another host, name, or auth type; use -find-json or the "
+                    "use another host, name, or auth type; use -json or the "
                     "URL from 'certipy find' to target the published endpoint"
                 )
 

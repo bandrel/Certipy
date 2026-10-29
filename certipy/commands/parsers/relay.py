@@ -64,7 +64,7 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> Tuple[str, Callable
         help=(
             "protocol://<IP address or hostname> of certificate authority. "
             "Example: http://ca.corp.local for ESC8, rpc://ca.corp.local for ESC11, "
-            "or the full CES URL (https://ca.corp.local/<CA>_CES_Kerberos/service.svc/CES) with -ces. Optional with -ces -find-json."
+            "or the full CES URL (https://ca.corp.local/<CA>_CES_Kerberos/service.svc/CES) with -ces. Optional with -ces -json."
         ),
     )
 
@@ -211,11 +211,11 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> Tuple[str, Callable
         help=(
             "Relay to a Certificate Enrollment Web Service (CES) endpoint instead of "
             "Web Enrollment; -target is the CES URL, a host with -ca, or omitted "
-            "with -find-json"
+            "with -json"
         ),
     )
     relay_group.add_argument(
-        "-find-json",
+        "-json",
         action="store",
         dest="find_json",
         metavar="find JSON file",
