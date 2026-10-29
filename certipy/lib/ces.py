@@ -8,16 +8,23 @@ exposed at https://<host>/<CA name>_CES_Kerberos/service.svc/CES.
 Key components:
 - default_ces_path: Build the default CES endpoint path for a CA
 - build_wstep_request: Build a WS-Trust RequestSecurityToken SOAP envelope
+- parse_wstep_response: Parse a RequestSecurityTokenResponse or SOAP fault
+- CESError: Raised for SOAP faults and unusable responses
 
 The message format follows the CES relay attack in Impacket
 (https://github.com/fortra/impacket/pull/2325).
 """
 
 import base64
+import re
 import uuid
+from dataclasses import dataclass
 from html import escape
 from typing import List, Optional
 from urllib.parse import quote
+from xml.etree import ElementTree
+
+from certipy.lib.certificate import der_to_cert, x509
 
 # =========================================================================
 # Constants
@@ -137,3 +144,135 @@ def build_wstep_request(
     )
 
     return envelope.encode("utf-8")
+
+
+# =========================================================================
+# Response parsing
+# =========================================================================
+
+
+class CESError(Exception):
+    """
+    Error returned by the Certificate Enrollment Web Service.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        error_code: Optional[int] = None,
+        request_id: Optional[int] = None,
+    ):
+        """
+        Initialize the CES error.
+
+        Args:
+            message: Fault reason or error description
+            error_code: HRESULT from the fault detail, as an unsigned 32-bit value
+            request_id: Request ID from the fault detail
+        """
+        super().__init__(message)
+        self.error_code = error_code
+        self.request_id = request_id
+
+
+@dataclass
+class WstepResponse:
+    """
+    Parsed WSTEP RequestSecurityTokenResponse.
+
+    A response without a certificate means the request is pending.
+    """
+
+    certificate: Optional[x509.Certificate]
+    request_id: Optional[int]
+    disposition_message: Optional[str]
+
+
+def _find_text(element: ElementTree.Element, path: str) -> Optional[str]:
+    """
+    Get the stripped text of the first element matching a path.
+
+    Args:
+        element: Element to search from
+        path: ElementTree path expression
+
+    Returns:
+        Element text, or None if missing or empty
+    """
+    text = element.findtext(path)
+    if text is None:
+        return None
+    return text.strip() or None
+
+
+def _parse_int(value: Optional[str]) -> Optional[int]:
+    """
+    Parse an optional decimal integer.
+
+    Args:
+        value: Decimal string or None
+
+    Returns:
+        Parsed integer, or None if missing or invalid
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def parse_wstep_response(data: bytes) -> WstepResponse:
+    """
+    Parse a WSTEP response from the Certificate Enrollment Web Service.
+
+    Args:
+        data: Raw response body
+
+    Returns:
+        Parsed response; certificate is None if the request is pending
+
+    Raises:
+        CESError: If the service returned a SOAP fault or an unusable response
+    """
+    if not data:
+        raise CESError("CES returned an empty response")
+    if len(data) > MAX_RESPONSE_SIZE:
+        raise CESError(f"CES response exceeds {MAX_RESPONSE_SIZE} bytes")
+
+    try:
+        root = ElementTree.fromstring(data)
+    except ElementTree.ParseError as e:
+        raise CESError(f"CES returned malformed XML: {e}") from e
+
+    request_id = _parse_int(_find_text(root, f".//{{{ENROLL_NS}}}RequestID"))
+
+    fault = root.find(f".//{{{SOAP_NS}}}Fault")
+    if fault is not None:
+        reason = _find_text(fault, f".//{{{SOAP_NS}}}Text") or "Unspecified fault"
+        error_code = _parse_int(_find_text(fault, f".//{{{ENROLL_NS}}}ErrorCode"))
+        if error_code is not None:
+            # ErrorCode is a signed HRESULT
+            error_code &= 0xFFFFFFFF
+        raise CESError(reason, error_code=error_code, request_id=request_id)
+
+    certificate = None
+    for token in root.iter(f"{{{WSS_NS}}}BinarySecurityToken"):
+        if "X509v3" not in token.get("ValueType", ""):
+            continue
+
+        value = re.sub(r"\s+", "", token.text or "")
+        if not value:
+            continue
+
+        try:
+            certificate = der_to_cert(base64.b64decode(value, validate=True))
+        except ValueError as e:
+            raise CESError("CES returned an invalid X509v3 certificate token") from e
+
+    return WstepResponse(
+        certificate=certificate,
+        request_id=request_id,
+        disposition_message=_find_text(root, f".//{{{ENROLL_NS}}}DispositionMessage"),
+    )

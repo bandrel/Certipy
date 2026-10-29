@@ -1,12 +1,19 @@
 import base64
+import datetime
 import xml.etree.ElementTree as ET
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 from certipy.lib.ces import (
     ADDR_NS,
     AUTHZ_NS,
     ENCODING_TYPE_BASE64,
+    ENROLL_NS,
+    MAX_RESPONSE_SIZE,
     REQUEST_TYPE_ISSUE,
     SOAP_NS,
     TOKEN_TYPE_X509V3,
@@ -14,8 +21,10 @@ from certipy.lib.ces import (
     WSS_NS,
     WST_NS,
     WSTEP_ACTION,
+    CESError,
     build_wstep_request,
     default_ces_path,
+    parse_wstep_response,
 )
 
 CES_URL = "https://braavos.essos.local/ESSOS-CA_CES_Kerberos/service.svc/CES"
@@ -99,3 +108,116 @@ def test_build_wstep_request_escapes_values():
 def test_build_wstep_request_rejects_malformed_attribute():
     with pytest.raises(ValueError):
         build_wstep_request(CES_URL, CSR, ["NoColonHere"])
+
+
+def _self_signed_der() -> bytes:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ces-test")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(1)
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .sign(key, hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.DER)
+
+
+def _rstr(
+    cert_token: str = "", request_id: str = "17", disposition: str = "Issued"
+) -> bytes:
+    issued = (
+        f"<RequestedSecurityToken><BinarySecurityToken "
+        f'ValueType="{TOKEN_TYPE_X509V3}" EncodingType="{ENCODING_TYPE_BASE64}" '
+        f'xmlns="{WSS_NS}">{cert_token}</BinarySecurityToken></RequestedSecurityToken>'
+        if cert_token
+        else ""
+    )
+    return (
+        f'<s:Envelope xmlns:s="{SOAP_NS}" xmlns:a="{ADDR_NS}"><s:Body>'
+        f'<RequestSecurityTokenResponseCollection xmlns="{WST_NS}">'
+        "<RequestSecurityTokenResponse>"
+        f"<TokenType>{TOKEN_TYPE_X509V3}</TokenType>"
+        f'<DispositionMessage xml:lang="en-US" xmlns="{ENROLL_NS}">{disposition}</DispositionMessage>'
+        f'<BinarySecurityToken ValueType="{ENROLL_NS}#PKCS7" '
+        f'EncodingType="{ENCODING_TYPE_BASE64}" xmlns="{WSS_NS}">MIIB</BinarySecurityToken>'
+        f"{issued}"
+        f'<RequestID xmlns="{ENROLL_NS}">{request_id}</RequestID>'
+        "</RequestSecurityTokenResponse>"
+        "</RequestSecurityTokenResponseCollection>"
+        "</s:Body></s:Envelope>"
+    ).encode()
+
+
+def _fault(reason: str, error_code: str | None, request_id: str | None) -> bytes:
+    detail = ""
+    if error_code is not None or request_id is not None:
+        detail = f'<s:Detail><CertificateEnrollmentWSDetail xmlns="{ENROLL_NS}">'
+        if error_code is not None:
+            detail += f"<ErrorCode>{error_code}</ErrorCode>"
+        if request_id is not None:
+            detail += f"<RequestID>{request_id}</RequestID>"
+        detail += "</CertificateEnrollmentWSDetail></s:Detail>"
+    return (
+        f'<s:Envelope xmlns:s="{SOAP_NS}"><s:Body><s:Fault>'
+        "<s:Code><s:Value>s:Receiver</s:Value></s:Code>"
+        f'<s:Reason><s:Text xml:lang="en-US">{reason}</s:Text></s:Reason>'
+        f"{detail}</s:Fault></s:Body></s:Envelope>"
+    ).encode()
+
+
+def test_parse_issued_certificate():
+    der = _self_signed_der()
+    b64 = base64.b64encode(der).decode()
+    # CES wraps base64 across lines; whitespace must be ignored
+    wrapped = "\r\n".join(b64[i : i + 64] for i in range(0, len(b64), 64))
+    response = parse_wstep_response(_rstr(cert_token=wrapped, request_id="17"))
+    assert response.certificate is not None
+    assert response.certificate.public_bytes(serialization.Encoding.DER) == der
+    assert response.request_id == 17
+    assert response.disposition_message == "Issued"
+
+
+def test_parse_pending():
+    response = parse_wstep_response(
+        _rstr(request_id="19", disposition="Taken Under Submission")
+    )
+    assert response.certificate is None
+    assert response.request_id == 19
+    assert response.disposition_message == "Taken Under Submission"
+
+
+def test_parse_fault_with_detail():
+    # 0x80094012 CERTSRV_E_TEMPLATE_DENIED, sent as a signed decimal
+    with pytest.raises(CESError) as excinfo:
+        parse_wstep_response(_fault("Denied by Policy Module", "-2146877422", "18"))
+    assert str(excinfo.value) == "Denied by Policy Module"
+    assert excinfo.value.error_code == 0x80094012
+    assert excinfo.value.request_id == 18
+
+
+def test_parse_fault_without_detail():
+    with pytest.raises(CESError) as excinfo:
+        parse_wstep_response(_fault("Access is denied.", None, None))
+    assert str(excinfo.value) == "Access is denied."
+    assert excinfo.value.error_code is None
+    assert excinfo.value.request_id is None
+
+
+def test_parse_invalid_certificate_token():
+    with pytest.raises(CESError):
+        parse_wstep_response(_rstr(cert_token="bm90IGEgY2VydA=="))
+
+
+@pytest.mark.parametrize(
+    "data",
+    [b"", b"<not-xml", b"x" * (MAX_RESPONSE_SIZE + 1)],
+    ids=["empty", "malformed", "oversized"],
+)
+def test_parse_rejects_bad_bodies(data: bytes):
+    with pytest.raises(CESError):
+        parse_wstep_response(data)
