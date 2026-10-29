@@ -61,7 +61,8 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> Tuple[str, Callable
         required=True,
         help=(
             "protocol://<IP address or hostname> of certificate authority. "
-            "Example: http://ca.corp.local for ESC8 or rpc://ca.corp.local for ESC11"
+            "Example: http://ca.corp.local for ESC8, rpc://ca.corp.local for ESC11, "
+            "or the full CES URL (https://ca.corp.local/<CA>_CES_Kerberos/service.svc/CES) with -ces"
         ),
     )
 
@@ -201,6 +202,14 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> Tuple[str, Callable
         "-enum-templates",
         action="store_true",
         help="Relay to /certsrv/certrqxt.asp and parse available certificate templates",
+    )
+    relay_group.add_argument(
+        "-ces",
+        action="store_true",
+        help=(
+            "Relay to a Certificate Enrollment Web Service (CES) endpoint instead of "
+            "Web Enrollment; -target must be the CES URL"
+        ),
     )
 
     # Connection parameters

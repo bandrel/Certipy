@@ -840,6 +840,7 @@ class Relay:
         no_skip: bool = False,
         timeout: int = 5,
         enum_templates: bool = False,
+        ces: bool = False,
         **kwargs,  # type: ignore
     ):
         """
@@ -866,6 +867,7 @@ class Relay:
             no_skip: Don't skip already attacked targets
             timeout: Connection timeout in seconds
             enum_templates: Enumerate available templates instead of requesting certificate
+            ces: Relay to a CES endpoint; target is kept verbatim as the CES URL
             kwargs: Additional arguments
         """
         self.target = target
@@ -887,6 +889,8 @@ class Relay:
         self.interface = interface
         self.port = port
         self.enum_templates = enum_templates
+        self.ces = ces
+        self.ces_to_url: Optional[str] = None
         self.kwargs = kwargs
         self.key: Optional[rsa.RSAPrivateKey] = None
 
@@ -909,6 +913,16 @@ class Relay:
                 exit(1)
 
             logging.info(f"Targeting {target} (ESC11)")
+        elif self.ces:
+            if self.request_id or self.enum_templates:
+                logging.error(
+                    "-retrieve and -enum-templates are not supported with -ces"
+                )
+                exit(1)
+
+            self.base_url, self.ces_to_url, _ = self._build_ces_target(self.target)
+            self.target = self.ces_to_url
+            logging.info(f"Targeting {self.target} (ESC8 - CES)")
         else:
             # Format HTTP target URL
             if not self.target.startswith("http://") and not self.target.startswith(
@@ -971,6 +985,28 @@ class Relay:
         config.setMode("RELAY")
 
         self.server = SMBRelayServer(config)
+
+    @staticmethod
+    def _build_ces_target(target: str) -> Tuple[str, str, str]:
+        """
+        Parse a CES target URL, keeping its path verbatim.
+
+        Args:
+            target: CES URL, with or without a scheme (https is assumed if omitted)
+
+        Returns:
+            Tuple of (base_url, to_url, path), where base_url is scheme://host[:port],
+            to_url is the full URL and path is the URL path
+        """
+        if not target.startswith("http://") and not target.startswith("https://"):
+            target = f"https://{target}"
+
+        url = httpx.URL(target)
+        base_url = f"{url.scheme}://{url.host}"
+        if url.port is not None:
+            base_url += f":{url.port}"
+
+        return base_url, str(url), url.path or "/"
 
     @property
     def request(self) -> Request:
