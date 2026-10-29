@@ -20,7 +20,7 @@ import json
 import time
 from collections import OrderedDict
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union, cast
 
 import httpx
 import requests
@@ -455,7 +455,10 @@ class Find:
                             "http": {"enabled": "Unknown"},
                             "https": {"enabled": "Unknown", "channel_binding": None},
                         },
-                        "enrollment_web_service": [],
+                        # Listed from LDAP only; endpoints are not probed
+                        "enrollment_web_service": self._check_enrollment_web_service(
+                            ca, probe=False
+                        ),
                     }
 
                 else:
@@ -612,12 +615,17 @@ class Find:
 
         return ca_properties
 
-    def _check_enrollment_web_service(self, ca: LDAPEntry) -> List[Dict[str, Any]]:
+    def _check_enrollment_web_service(
+        self, ca: LDAPEntry, probe: bool = True
+    ) -> List[Dict[str, Any]]:
         """
         Read msPKI-Enrollment-Servers for a CA and probe each CES endpoint.
 
         Args:
             ca: Certificate authority object
+            probe: Whether to contact each endpoint. When False (DC-only
+                mode), reachability and channel binding are reported as
+                "Unknown"
 
         Returns:
             List of endpoint dictionaries (uri, auth, priority, renewals_only,
@@ -632,9 +640,14 @@ class Find:
 
         endpoints: List[Dict[str, Any]] = []
         for server in parse_enrollment_servers(decoded):
-            logging.debug(f"Probing CES endpoint {server.uri!r}")
             scheme = "https" if server.uri.lower().startswith("https") else "http"
-            reachable, channel_binding = self.probe_enrollment_server(server.uri)
+            reachable: Union[bool, str]
+            channel_binding: Optional[Union[bool, str]]
+            if probe:
+                logging.debug(f"Probing CES endpoint {server.uri!r}")
+                reachable, channel_binding = self.probe_enrollment_server(server.uri)
+            else:
+                reachable, channel_binding = "Unknown", "Unknown"
             endpoints.append(
                 {
                     "uri": server.uri,
@@ -861,7 +874,9 @@ class Find:
         relayable: List[Dict[str, Any]] = []
         possible: List[Dict[str, Any]] = []
         for ep in endpoints or []:
-            if not ep.get("reachable") or "Kerberos" not in (ep.get("auth") or []):
+            if ep.get("reachable") is not True or "Kerberos" not in (
+                ep.get("auth") or []
+            ):
                 continue
             if ep.get("scheme") == "http":
                 relayable.append(ep)
@@ -895,7 +910,10 @@ class Find:
             return None
         ep = relayable[0]
         mode = "http" if ep["scheme"] == "http" else "https, EPA not enforced"
-        return f"CES enrollment endpoint is relayable: {ep['uri']} ({mode})"
+        return (
+            "Certificate Enrollment Web Service (CES) is relayable: "
+            f"{ep['uri']} ({mode})."
+        )
 
     @staticmethod
     def evaluate_esc8_ces_remark(
@@ -918,13 +936,19 @@ class Find:
         relayable, possible = Find._relayable_ces_endpoints(endpoints)
         if relayable:
             return None
+        if all(ep.get("reachable") == "Unknown" for ep in endpoints):
+            return (
+                "Certificate Enrollment Web Service (CES) endpoints were not "
+                f"probed (DC-only mode): {endpoints[0]['uri']}; "
+                "they may be relayable."
+            )
         if possible:
             return (
                 "EPA couldn't be verified for HTTPS CES endpoint "
                 f"{possible[0]['uri']}; it may be relayable."
             )
         return (
-            "Enrollment Web Service is present but not relayable "
+            "Certificate Enrollment Web Service (CES) is present but not relayable "
             "(unreachable, EPA enforced, or no Kerberos/Negotiate authentication)."
         )
 
@@ -946,6 +970,8 @@ class Find:
                 epa = "Enabled"
             elif binding is False:
                 epa = "Disabled"
+            elif ep.get("scheme") == "http":
+                epa = "N/A"
             else:
                 epa = "Unknown"
             auth = ", ".join(ep.get("auth") or [])
@@ -1309,7 +1335,7 @@ class Find:
 
         # Save text output
         if self.text or not_specified:
-            output_text_stdout = copy.copy(output)
+            output_text_stdout = self._format_ces_for_text(output)
 
             if self.trailing_output:
                 output_text_stdout["ESC14"] = self.trailing_output
@@ -1380,6 +1406,35 @@ class Find:
             logging.info(f"Saving CA CSV output to {ca_output_path!r}")
             ca_output_path = try_to_save_file(ca_output, ca_output_path)
             logging.info(f"Wrote CA CSV output to {ca_output_path!r}")
+
+    def _format_ces_for_text(self, output: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Render CES endpoints as readable strings for text output only.
+
+        The structured endpoint dictionaries are kept in ``output`` so that
+        JSON consumers receive real booleans and lists.
+
+        Args:
+            output: Dictionary from get_output_for_text_and_json
+
+        Returns:
+            Shallow copy of the output with CES endpoints formatted as strings
+        """
+        result = copy.copy(output)
+        cas = output.get("Certificate Authorities")
+        if not isinstance(cas, dict):
+            return result
+        formatted_cas: Dict[Any, Any] = {}
+        for id_, ca_entry in cas.items():
+            endpoints = ca_entry.get("Enrollment Web Service")
+            if isinstance(endpoints, list) and endpoints:
+                ca_entry = copy.copy(ca_entry)
+                ca_entry["Enrollment Web Service"] = self.format_enrollment_web_service(
+                    endpoints
+                )
+            formatted_cas[id_] = ca_entry
+        result["Certificate Authorities"] = formatted_cas
+        return result
 
     def get_output_for_text_and_json(
         self, templates: List[LDAPEntry], cas: List[LDAPEntry], oids: List[LDAPEntry]
@@ -1666,7 +1721,15 @@ class Find:
 
             # One entry per CES endpoint
             elif key == "Enrollment Web Service" and isinstance(value, list):
-                items.append(("CES Endpoint", "\n".join(map(str, value))))
+                lines = [
+                    (
+                        self.format_enrollment_web_service([v])[0]
+                        if isinstance(v, dict)
+                        else str(v)
+                    )
+                    for v in value
+                ]
+                items.append(("CES Endpoint", "\n".join(lines)))
 
             # Handle permissions specially
             elif "Permissions" in key and isinstance(value, dict):
@@ -1947,12 +2010,9 @@ class Find:
         # Extract properties that exist
         for property_key, display_name in properties_map.items():
             property_value = ca.get(property_key)
-            if property_key == "enrollment_web_service":
-                # Only emit when CES endpoints exist, as readable strings
-                if property_value:
-                    property_value = self.format_enrollment_web_service(property_value)
-                else:
-                    continue
+            if property_key == "enrollment_web_service" and not property_value:
+                # Only emit when CES endpoints exist
+                continue
             if property_value is not None:
                 ca_properties[display_name] = property_value
 
@@ -2608,15 +2668,13 @@ class Find:
         if ces_finding:
             existing = vulnerabilities.get("ESC8")
             vulnerabilities["ESC8"] = (
-                f"{existing}; {ces_finding}" if existing else ces_finding
+                f"{existing} {ces_finding}" if existing else ces_finding
             )
         else:
             ces_remark = self.evaluate_esc8_ces_remark(ces_endpoints, will_issue)
             if ces_remark:
                 existing = remarks.get("ESC8")
-                remarks["ESC8"] = (
-                    f"{existing}; {ces_remark}" if existing else ces_remark
-                )
+                remarks["ESC8"] = f"{existing} {ces_remark}" if existing else ces_remark
 
         # ESC11: Unencrypted certificate requests
         if ca.get("enforce_encrypt_icertrequest") == "Disabled" and will_issue:

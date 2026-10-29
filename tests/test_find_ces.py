@@ -200,3 +200,116 @@ def test_ces_remark_emitted_alongside_web_enrollment_esc8():
     vulns, remarks, _, _ = f.get_ca_vulnerabilities(ca)
     assert "ESC8" in vulns
     assert "EPA couldn't be verified" in remarks["ESC8"]
+
+
+CES_SERVER = b"1\n2\n0\nhttps://ca/ESSOS-CA_CES_Kerberos/service.svc/CES\n0"
+
+
+def test_dc_only_lists_ces_endpoints_without_probing():
+    f = _find()
+    f.dc_only = True
+
+    def boom(uri: str):
+        raise AssertionError("probe must not run in dc-only mode")
+
+    f.probe_enrollment_server = boom  # type: ignore
+    ca = LDAPEntry(attributes={"msPKI-Enrollment-Servers": [CES_SERVER]})
+    f._process_ca_properties([ca])
+    endpoints = ca.get("enrollment_web_service")
+    assert len(endpoints) == 1
+    assert endpoints[0]["uri"] == "https://ca/ESSOS-CA_CES_Kerberos/service.svc/CES"
+    assert endpoints[0]["scheme"] == "https"
+    assert endpoints[0]["reachable"] == "Unknown"
+    assert endpoints[0]["channel_binding"] == "Unknown"
+
+
+def test_dc_only_ces_endpoints_are_not_a_hard_esc8():
+    eps = [_ep(reachable="Unknown", channel_binding="Unknown")]
+    assert Find.evaluate_esc8_ces(eps, True) is None
+    eps = [_ep(scheme="http", reachable="Unknown", channel_binding="Unknown")]
+    assert Find.evaluate_esc8_ces(eps, True) is None
+    remark = Find.evaluate_esc8_ces_remark(eps, True)
+    assert remark and "not probed" in remark
+
+
+def test_check_enrollment_web_service_no_probe():
+    f = _find()
+    ca = LDAPEntry(attributes={"msPKI-Enrollment-Servers": [CES_SERVER]})
+    result = f._check_enrollment_web_service(ca, probe=False)
+    assert result[0]["reachable"] == "Unknown"
+
+
+def test_ca_properties_keep_structured_ces_for_json():
+    f = _find()
+    ca = LDAPEntry(attributes={"enrollment_web_service": [_ep(channel_binding=False)]})
+    props = f.get_ca_properties(ca)
+    eps = props["Enrollment Web Service"]
+    assert isinstance(eps[0], dict)
+    assert eps[0]["reachable"] is True
+    assert eps[0]["channel_binding"] is False
+    assert eps[0]["auth"] == ["Kerberos"]
+
+
+def test_text_output_formats_ces_endpoints():
+    f = _find()
+    ca = LDAPEntry(attributes={"enrollment_web_service": [_ep(channel_binding=False)]})
+    output = {
+        "Certificate Authorities": {0: f.get_ca_properties(ca)},
+        "Certificate Templates": {},
+    }
+    text = f._format_ces_for_text(output)
+    lines = text["Certificate Authorities"][0]["Enrollment Web Service"]
+    assert lines == [
+        "https://h/ca_CES_Kerberos/service.svc/CES [Kerberos] reachable=True EPA=Disabled"
+    ]
+    # the structured output is left untouched
+    assert isinstance(
+        output["Certificate Authorities"][0]["Enrollment Web Service"][0], dict
+    )
+
+
+def test_csv_output_formats_structured_ces_endpoints():
+    f = _find()
+    out = f.get_ca_output_for_csv(
+        {
+            "Certificate Authorities": {
+                0: {
+                    "CA Name": "CA",
+                    "Enrollment Web Service": [_ep(channel_binding=False)],
+                }
+            }
+        }
+    )
+    assert "reachable=True EPA=Disabled" in out
+
+
+def test_format_enrollment_web_service_http_epa_not_applicable():
+    out = Find.format_enrollment_web_service(
+        [_ep(scheme="http", uri="http://h/ca_CES_Kerberos/service.svc/CES")]
+    )
+    assert out[0].endswith("reachable=True EPA=N/A")
+
+
+def test_esc8_messages_join_cleanly():
+    f = _find()
+    f.can_user_enroll_in_ca = lambda ca: (True, [])  # type: ignore
+    f.format_principals = lambda sids: []  # type: ignore
+    f.ca_has_vulnerable_acl = lambda ca: (False, [])  # type: ignore
+    ca = LDAPEntry(
+        attributes={
+            "request_disposition": "Issue",
+            "web_enrollment": {
+                "http": {"enabled": True},
+                "https": {"enabled": False, "channel_binding": None},
+            },
+            "enrollment_web_service": [
+                _ep(scheme="http", uri="http://h/ca_CES_Kerberos/service.svc/CES")
+            ],
+        }
+    )
+    vulns, _, _, _ = f.get_ca_vulnerabilities(ca)
+    assert ".;" not in vulns["ESC8"]
+    assert vulns["ESC8"].endswith(
+        "Certificate Enrollment Web Service (CES) is relayable: "
+        "http://h/ca_CES_Kerberos/service.svc/CES (http)."
+    )
