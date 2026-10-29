@@ -631,7 +631,9 @@ class ADCSHTTPAttackClient(ProtocolAttack):
             )
 
         ces_to_url = self.adcs_relay.ces_to_url
-        assert ces_to_url is not None, "ces_to_url must be set when -ces is used"
+        if ces_to_url is None:
+            logging.error("CES target URL is not set")
+            return self.finish_run()
 
         # Choose appropriate template based on username
         template = self.config.template
@@ -662,7 +664,7 @@ class ADCSHTTPAttackClient(ProtocolAttack):
         body = build_wstep_request(ces_to_url, csr_der, attributes)
 
         logging.info(
-            f"Requesting certificate for {self.client.user!r} based on the template {template!r}"
+            f"Requesting certificate for {self.client.user} based on the template {template!r}"
         )
 
         # Certificate issuance can take significantly longer than the NTLM
@@ -680,12 +682,24 @@ class ADCSHTTPAttackClient(ProtocolAttack):
         # incorrectly when sent on the wire.
         path = httpx.URL(ces_to_url).raw_path.decode()
 
-        res = self.client.post(
-            path,
-            content=body,
-            headers={"Content-Type": SOAP_CONTENT_TYPE},
-            timeout=cert_request_timeout,
-        )
+        try:
+            res = self.client.post(
+                path,
+                content=body,
+                headers={"Content-Type": SOAP_CONTENT_TYPE},
+                timeout=cert_request_timeout,
+            )
+        except httpx.ReadTimeout:
+            logging.error(
+                f"Certificate request timed out after {cert_request_timeout}s waiting for "
+                "CES to respond. The CA may be slow or under load. "
+                "Try increasing the timeout with '-timeout <seconds>' (e.g., -timeout 120)"
+            )
+            return self.finish_run()
+        except Exception as e:
+            logging.error(f"Error during CES certificate request: {e}")
+            handle_error()
+            return self.finish_run()
 
         if res.status_code == 401:
             logging.error("Relayed CES request was unauthorized")

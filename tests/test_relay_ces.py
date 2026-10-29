@@ -59,9 +59,12 @@ def _make_attack(
     to_url: str = CES_URL,
     template: Optional[str] = "User",
     username: str = "missandei",
+    session_timeout: Optional[float] = 5.0,
 ) -> relay_module.ADCSHTTPAttackClient:
     client = httpx.Client(
-        base_url="https://10.0.0.5", transport=httpx.MockTransport(handler)
+        base_url="https://10.0.0.5",
+        transport=httpx.MockTransport(handler),
+        timeout=session_timeout,
     )
     client.user = "ESSOS\\missandei"  # type: ignore[attr-defined]
     adcs_relay = SimpleNamespace(
@@ -261,13 +264,36 @@ def test_ces_attack_timeout_override(
         seen["read"] = request.extensions["timeout"]["read"]
         return httpx.Response(401)
 
-    attack = _make_attack(handler)
-    client = httpx.Client(
-        base_url="https://10.0.0.5",
-        transport=httpx.MockTransport(handler),
-        timeout=session_timeout,
-    )
-    client.user = "ESSOS\\missandei"  # type: ignore[attr-defined]
-    attack.client = client  # type: ignore[attr-defined]
+    attack = _make_attack(handler, session_timeout=session_timeout)
     attack._request_certificate_ces()
     assert seen["read"] == expected
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ReadTimeout("timed out"),
+        httpx.ConnectError("connection reset"),
+    ],
+)
+def test_ces_attack_network_error_finishes_run(
+    monkeypatch: pytest.MonkeyPatch, exc: Exception
+):
+    saved = _record_saves(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise exc
+
+    attack = _make_attack(handler)
+    attack._request_certificate_ces()
+    assert saved == []
+    assert attack.adcs_relay.attacked_targets == ["ESSOS\\missandei"]
+
+
+def test_ces_attack_missing_target_url_finishes_run(monkeypatch: pytest.MonkeyPatch):
+    saved = _record_saves(monkeypatch)
+    attack = _make_attack(lambda r: httpx.Response(401))
+    attack.adcs_relay.ces_to_url = None  # type: ignore[attr-defined]
+    attack._request_certificate_ces()
+    assert saved == []
+    assert attack.adcs_relay.attacked_targets == ["ESSOS\\missandei"]
