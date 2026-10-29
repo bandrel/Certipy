@@ -10,6 +10,7 @@ Key components:
 - build_wstep_request: Build a WS-Trust RequestSecurityToken SOAP envelope
 - parse_wstep_response: Parse a RequestSecurityTokenResponse or SOAP fault
 - CESError: Raised for SOAP faults and unusable responses
+- parse_enrollment_servers: Parse the AD msPKI-Enrollment-Servers attribute
 
 The message format follows the CES relay attack in Impacket
 (https://github.com/fortra/impacket/pull/2325).
@@ -20,7 +21,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from html import escape
-from typing import List, Optional
+from typing import Iterable, List, Optional
 from urllib.parse import quote
 from xml.etree import ElementTree
 
@@ -336,3 +337,92 @@ def parse_wstep_response(data: bytes) -> WstepResponse:
         request_id=request_id,
         disposition_message=_find_text(root, f".//{{{ENROLL_NS}}}DispositionMessage"),
     )
+
+
+# =========================================================================
+# Enrollment server directory (msPKI-Enrollment-Servers)
+# =========================================================================
+
+# CES authentication type bit flags (MS-WSTEP / MS-CRTD)
+AUTH_FLAG_NAMES = {
+    1: "Anonymous",
+    2: "Kerberos",
+    4: "UsernameAndPassword",
+    8: "Certificate",
+}
+
+
+def decode_enrollment_auth(value: int) -> List[str]:
+    """
+    Decode a CES authentication bit field into human-readable names.
+
+    Args:
+        value: Authentication flags from msPKI-Enrollment-Servers
+
+    Returns:
+        Flag names present in value, ascending by bit; unknown bits as "Unknown(0x..)"
+    """
+    names = []
+    for bit in range(value.bit_length()):
+        mask = 1 << bit
+        if not value & mask:
+            continue
+        names.append(AUTH_FLAG_NAMES.get(mask, f"Unknown(0x{mask:x})"))
+    return names
+
+
+@dataclass(frozen=True)
+class EnrollmentServer:
+    """
+    One Certificate Enrollment Web Service endpoint published in AD.
+    """
+
+    priority: int
+    authentication: int
+    auth_names: List[str]
+    renewals_only: bool
+    uri: str
+    key_based_renewal: bool
+
+
+def parse_enrollment_servers(
+    values: Optional[Iterable[str]],
+) -> List[EnrollmentServer]:
+    """
+    Parse the msPKI-Enrollment-Servers attribute of a pKIEnrollmentService object.
+
+    Each value is five newline-separated fields:
+    Priority, Authentication, AllowRenewalsOnly, URI, AllowKeyBasedRenewal.
+
+    Args:
+        values: Raw attribute values (strings), or None
+
+    Returns:
+        Parsed endpoints, sorted by priority; malformed values are skipped
+    """
+    servers = []
+    for value in values or []:
+        fields = str(value).split("\n")
+        if len(fields) < 5:
+            continue
+        try:
+            priority = int(fields[0])
+            authentication = int(fields[1])
+        except ValueError:
+            continue
+        uri = fields[3].strip()
+        if not uri:
+            continue
+        servers.append(
+            EnrollmentServer(
+                priority=priority,
+                authentication=authentication,
+                auth_names=decode_enrollment_auth(authentication),
+                renewals_only=fields[2].strip() == "1",
+                uri=uri,
+                key_based_renewal=fields[4].strip() == "1",
+            )
+        )
+
+    servers.sort(key=lambda s: s.priority)
+    return servers

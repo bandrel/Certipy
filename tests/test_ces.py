@@ -23,8 +23,11 @@ from certipy.lib.ces import (
     WST_NS,
     WSTEP_ACTION,
     CESError,
+    EnrollmentServer,
     build_wstep_request,
+    decode_enrollment_auth,
     default_ces_path,
+    parse_enrollment_servers,
     parse_wstep_response,
 )
 
@@ -293,3 +296,51 @@ def test_parse_invalid_certificate_token():
 def test_parse_rejects_bad_bodies(data: bytes):
     with pytest.raises(CESError):
         parse_wstep_response(data)
+
+
+GOAD_VALUE = (
+    "1\n2\n0\nhttps://braavos.essos.local/ESSOS-CA_CES_Kerberos/service.svc/CES\n0"
+)
+
+
+def test_decode_enrollment_auth_single():
+    assert decode_enrollment_auth(2) == ["Kerberos"]
+
+
+def test_decode_enrollment_auth_combined():
+    assert decode_enrollment_auth(2 | 4) == ["Kerberos", "UsernameAndPassword"]
+
+
+def test_decode_enrollment_auth_unknown_bit():
+    assert decode_enrollment_auth(2 | 16) == ["Kerberos", "Unknown(0x10)"]
+
+
+def test_parse_enrollment_servers_goad():
+    servers = parse_enrollment_servers([GOAD_VALUE])
+    assert servers == [
+        EnrollmentServer(
+            priority=1,
+            authentication=2,
+            auth_names=["Kerberos"],
+            renewals_only=False,
+            uri="https://braavos.essos.local/ESSOS-CA_CES_Kerberos/service.svc/CES",
+            key_based_renewal=False,
+        )
+    ]
+
+
+def test_parse_enrollment_servers_sorts_by_priority_and_skips_malformed():
+    high = "10\n2\n0\nhttps://a/ca_CES_Kerberos/service.svc/CES\n0"
+    low = "1\n4\n1\nhttps://b/ca_CES_UsernamePassword/service.svc/CES\n0"
+    servers = parse_enrollment_servers([high, low, "garbage", "", "1\n2"])
+    assert [s.uri for s in servers] == [
+        "https://b/ca_CES_UsernamePassword/service.svc/CES",
+        "https://a/ca_CES_Kerberos/service.svc/CES",
+    ]
+    assert servers[0].auth_names == ["UsernameAndPassword"]
+    assert servers[0].renewals_only is True
+
+
+def test_parse_enrollment_servers_empty():
+    assert parse_enrollment_servers([]) == []
+    assert parse_enrollment_servers(None) == []
