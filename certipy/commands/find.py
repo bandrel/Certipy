@@ -843,6 +843,117 @@ class Find:
             handle_error(True)
             return None
 
+    @staticmethod
+    def _relayable_ces_endpoints(
+        endpoints: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Split reachable Kerberos/Negotiate CES endpoints by relay exposure.
+
+        Args:
+            endpoints: CES endpoint dictionaries from the CA properties
+
+        Returns:
+            Tuple of (relayable, possible). Relayable endpoints are plain HTTP
+            or HTTPS with EPA confirmed off; possible endpoints are HTTPS where
+            EPA could not be determined.
+        """
+        relayable: List[Dict[str, Any]] = []
+        possible: List[Dict[str, Any]] = []
+        for ep in endpoints or []:
+            if not ep.get("reachable") or "Kerberos" not in (ep.get("auth") or []):
+                continue
+            if ep.get("scheme") == "http":
+                relayable.append(ep)
+            elif ep.get("scheme") == "https":
+                binding = ep.get("channel_binding")
+                if binding == "Unknown":
+                    possible.append(ep)
+                elif binding is not True:
+                    relayable.append(ep)
+        return relayable, possible
+
+    @staticmethod
+    def evaluate_esc8_ces(
+        endpoints: List[Dict[str, Any]], will_issue: bool
+    ) -> Optional[str]:
+        """
+        Evaluate CES endpoints for ESC8 NTLM relay exposure.
+
+        Args:
+            endpoints: CES endpoint dictionaries from the CA properties
+            will_issue: Whether the current principal can enroll on the CA
+
+        Returns:
+            Finding message when a reachable Kerberos/Negotiate endpoint is
+            relayable (HTTP, or HTTPS without EPA), otherwise None
+        """
+        if not will_issue:
+            return None
+        relayable, _ = Find._relayable_ces_endpoints(endpoints)
+        if not relayable:
+            return None
+        ep = relayable[0]
+        mode = "http" if ep["scheme"] == "http" else "https, EPA not enforced"
+        return f"CES enrollment endpoint is relayable: {ep['uri']} ({mode})"
+
+    @staticmethod
+    def evaluate_esc8_ces_remark(
+        endpoints: List[Dict[str, Any]], will_issue: bool
+    ) -> Optional[str]:
+        """
+        Build an ESC8 remark for CES endpoints that are present but not
+        confirmed relayable.
+
+        Args:
+            endpoints: CES endpoint dictionaries from the CA properties
+            will_issue: Whether the current principal can enroll on the CA
+
+        Returns:
+            Remark message, or None when there are no CES endpoints or one is
+            already a hard finding
+        """
+        if not will_issue or not endpoints:
+            return None
+        relayable, possible = Find._relayable_ces_endpoints(endpoints)
+        if relayable:
+            return None
+        if possible:
+            return (
+                "EPA couldn't be verified for HTTPS CES endpoint "
+                f"{possible[0]['uri']}; it may be relayable."
+            )
+        return (
+            "Enrollment Web Service is present but not relayable "
+            "(unreachable, EPA enforced, or no Kerberos/Negotiate authentication)."
+        )
+
+    @staticmethod
+    def format_enrollment_web_service(endpoints: List[Dict[str, Any]]) -> List[str]:
+        """
+        Format CES endpoints as human-readable strings, one per endpoint.
+
+        Args:
+            endpoints: CES endpoint dictionaries from the CA properties
+
+        Returns:
+            List of strings like "<uri> [auth] reachable=<bool> EPA=<state>"
+        """
+        lines = []
+        for ep in endpoints:
+            binding = ep.get("channel_binding")
+            if binding is True:
+                epa = "Enabled"
+            elif binding is False:
+                epa = "Disabled"
+            else:
+                epa = "Unknown"
+            auth = ", ".join(ep.get("auth") or [])
+            lines.append(
+                f"{ep.get('uri')} [{auth}] reachable={ep.get('reachable')} EPA={epa}"
+            )
+        return lines
+
     def probe_enrollment_server(
         self,
         uri: str,
@@ -861,7 +972,12 @@ class Find:
             when the endpoint answers with an auth challenge; channel_binding
             is None when not evaluated (unreachable, non-HTTPS, or inconclusive).
         """
-        parsed = httpx.URL(uri)
+        try:
+            parsed = httpx.URL(uri)
+        except Exception as e:
+            logging.debug(f"Malformed CES endpoint URI {uri!r}: {e}")
+            return False, None
+
         try:
             target_ip = self.target.resolver.resolve(parsed.host)
         except Exception as e:
@@ -1547,6 +1663,10 @@ class Find:
                             cb_status = "Disabled"
                         items.append(("Channel Binding", cb_status))
 
+            # One entry per CES endpoint
+            elif key == "Enrollment Web Service" and isinstance(value, list):
+                items.append(("CES Endpoint", "\n".join(map(str, value))))
+
             # Handle permissions specially
             elif "Permissions" in key and isinstance(value, dict):
                 # Process owner
@@ -1811,6 +1931,7 @@ class Find:
             "validity_start": "Certificate Validity Start",
             "validity_end": "Certificate Validity End",
             "web_enrollment": "Web Enrollment",
+            "enrollment_web_service": "Enrollment Web Service",
             "user_specified_san": "User Specified SAN",
             "request_disposition": "Request Disposition",
             "enforce_encrypt_icertrequest": "Enforce Encryption for Requests",
@@ -1825,6 +1946,12 @@ class Find:
         # Extract properties that exist
         for property_key, display_name in properties_map.items():
             property_value = ca.get(property_key)
+            if property_key == "enrollment_web_service":
+                # Only emit when CES endpoints exist, as readable strings
+                if property_value:
+                    property_value = self.format_enrollment_web_service(property_value)
+                else:
+                    continue
             if property_value is not None:
                 ca_properties[display_name] = property_value
 
@@ -2472,6 +2599,22 @@ class Find:
                     "Channel Binding couldn't be verified for HTTPS Web Enrollment. "
                     "For manual verification, request a certificate via HTTPS with Channel Binding disabled "
                     "and observe if the request succeeds or is rejected."
+                )
+
+        # ESC8: Relayable Certificate Enrollment Web Service (CES)
+        ces_endpoints = ca.get("enrollment_web_service") or []
+        ces_finding = self.evaluate_esc8_ces(ces_endpoints, will_issue)
+        if ces_finding:
+            existing = vulnerabilities.get("ESC8")
+            vulnerabilities["ESC8"] = (
+                f"{existing}; {ces_finding}" if existing else ces_finding
+            )
+        elif "ESC8" not in vulnerabilities:
+            ces_remark = self.evaluate_esc8_ces_remark(ces_endpoints, will_issue)
+            if ces_remark:
+                existing = remarks.get("ESC8")
+                remarks["ESC8"] = (
+                    f"{existing}; {ces_remark}" if existing else ces_remark
                 )
 
         # ESC11: Unencrypted certificate requests
