@@ -106,7 +106,13 @@ def test_ces_request_unauthorized_returns_none():
 
 def _parent(**overrides: Any) -> SimpleNamespace:
     values: dict[str, Any] = dict(
-        target=SimpleNamespace(target_ip="10.0.0.5", remote_name="braavos.essos.local"),
+        target=SimpleNamespace(
+            target_ip="10.0.0.5",
+            remote_name="braavos.essos.local",
+            do_kerberos=False,
+            timeout=5,
+        ),
+        no_channel_binding=False,
         ca="ESSOS-CA",
         ces_path=None,
         http_scheme="https",
@@ -121,6 +127,7 @@ def test_interface_default_urls():
     assert interface.path == PATH
     assert interface.base_url == "https://10.0.0.5:443"
     assert interface.endpoint_url == TO_URL
+    assert interface.session.headers["Host"] == "braavos.essos.local"
 
 
 def test_interface_non_default_port_and_custom_path():
@@ -132,12 +139,18 @@ def test_interface_non_default_port_and_custom_path():
         interface.endpoint_url
         == "https://braavos.essos.local:8443/Custom_CES_Kerberos/service.svc/CES"
     )
+    assert interface.session.headers["Host"] == "braavos.essos.local:8443"
 
 
 def test_interface_falls_back_to_ip_without_hostname():
-    parent = _parent(target=SimpleNamespace(target_ip="10.0.0.5", remote_name=""))
+    parent = _parent(
+        target=SimpleNamespace(
+            target_ip="10.0.0.5", remote_name="", do_kerberos=False, timeout=5
+        )
+    )
     interface = CESRequestInterface(parent)  # type: ignore[arg-type]
     assert interface.endpoint_url == f"https://10.0.0.5{PATH}"
+    assert interface.session.headers.get("Host") != ""
 
 
 def test_interface_requires_ca_or_path():

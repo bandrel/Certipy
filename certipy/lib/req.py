@@ -1402,6 +1402,17 @@ class CESRequestInterface:
 
         return default_ces_path(self.parent.ca)
 
+    def _scheme_and_port(self) -> Tuple[str, int]:
+        """
+        Resolve the URL scheme and port, applying defaults.
+
+        Returns:
+            Tuple of scheme and port
+        """
+        scheme = self.parent.http_scheme or "https"
+        port = self.parent.http_port or (443 if scheme == "https" else 80)
+        return scheme, port
+
     def _url(self, host: str) -> str:
         """
         Build a base URL for a host, omitting the port if it is the scheme default.
@@ -1412,8 +1423,7 @@ class CESRequestInterface:
         Returns:
             Base URL without a path
         """
-        scheme = self.parent.http_scheme or "https"
-        port = self.parent.http_port or (443 if scheme == "https" else 80)
+        scheme, port = self._scheme_and_port()
         if (scheme, port) in (("https", 443), ("http", 80)):
             return f"{scheme}://{host}"
         return f"{scheme}://{host}:{port}"
@@ -1426,8 +1436,7 @@ class CESRequestInterface:
         Returns:
             Base URL including the port
         """
-        scheme = self.parent.http_scheme or "https"
-        port = self.parent.http_port or (443 if scheme == "https" else 80)
+        scheme, port = self._scheme_and_port()
         return f"{scheme}://{self.target.target_ip}:{port}"
 
     @property
@@ -1456,7 +1465,10 @@ class CESRequestInterface:
                 channel_binding=not self.parent.no_channel_binding,
             )
             if self.target.remote_name:
-                self._session.headers["Host"] = self.target.remote_name
+                # Host must carry any non-default port, matching the To URL
+                self._session.headers["Host"] = self._url(
+                    self.target.remote_name
+                ).split("://", 1)[1]
 
         return self._session
 
