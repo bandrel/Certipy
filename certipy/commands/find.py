@@ -1578,6 +1578,7 @@ class Find:
             "Web Enrollment HTTP",
             "Web Enrollment HTTPS",
             "Channel Binding",
+            "CES Endpoint",
             "Owner",
             "Manage CA Principals",
             "Manage Certificates Principals",
@@ -2609,7 +2610,7 @@ class Find:
             vulnerabilities["ESC8"] = (
                 f"{existing}; {ces_finding}" if existing else ces_finding
             )
-        elif "ESC8" not in vulnerabilities:
+        else:
             ces_remark = self.evaluate_esc8_ces_remark(ces_endpoints, will_issue)
             if ces_remark:
                 existing = remarks.get("ESC8")

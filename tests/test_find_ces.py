@@ -165,3 +165,38 @@ def test_format_enrollment_web_service():
     assert out == [
         "https://h/ca_CES_Kerberos/service.svc/CES [Kerberos] reachable=True EPA=Disabled"
     ]
+
+
+def test_csv_output_includes_ces_endpoint_column():
+    f = _find()
+    line = "https://h/CES [Kerberos] reachable=True EPA=Disabled"
+    out = f.get_ca_output_for_csv(
+        {
+            "Certificate Authorities": {
+                0: {"CA Name": "CA", "Enrollment Web Service": [line]}
+            }
+        }
+    )
+    header, body = out.splitlines()[0], out.split("\n", 1)[1]
+    assert '"CES Endpoint"' in header
+    assert line in body
+
+
+def test_ces_remark_emitted_alongside_web_enrollment_esc8():
+    f = _find()
+    f.can_user_enroll_in_ca = lambda ca: (True, [])  # type: ignore
+    f.format_principals = lambda sids: []  # type: ignore
+    f.ca_has_vulnerable_acl = lambda ca: (False, [])  # type: ignore
+    ca = LDAPEntry(
+        attributes={
+            "request_disposition": "Issue",
+            "web_enrollment": {
+                "http": {"enabled": True},
+                "https": {"enabled": False, "channel_binding": None},
+            },
+            "enrollment_web_service": [_ep(channel_binding="Unknown")],
+        }
+    )
+    vulns, remarks, _, _ = f.get_ca_vulnerabilities(ca)
+    assert "ESC8" in vulns
+    assert "EPA couldn't be verified" in remarks["ESC8"]
